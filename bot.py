@@ -1,5 +1,5 @@
 import os, re, time, json, hashlib, feedparser, requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from openai import OpenAI
 import httpx
@@ -11,22 +11,45 @@ from bs4 import BeautifulSoup
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")
+
+# how often to poll feeds
 SLEEP_SECONDS    = int(os.getenv("SLEEP_SECONDS", "60"))
 
-# Optional filters
-MIN_CONFIDENCE   = int(os.getenv("MIN_CONFIDENCE", "0"))          # e.g. 70
+# only post news newer than this
+MAX_AGE_HOURS    = int(os.getenv("MAX_AGE_HOURS", "2"))  # <= 2 hours by default
+
+# optional filters
+MIN_CONFIDENCE   = int(os.getenv("MIN_CONFIDENCE", "0"))          # e.g., 70
 HIDE_NEUTRAL     = os.getenv("HIDE_NEUTRAL", "false").lower() in ("1","true","yes")
+
+# limit per cycle to avoid bursts (0 = unlimited)
+MAX_POSTS_PER_CYCLE = int(os.getenv("MAX_POSTS_PER_CYCLE", "0"))
 
 # Feeds (add extra RSS like X/Truth via EXTRA_RSS)
 FEEDS_ENV  = os.getenv("FEEDS", "").strip()
 EXTRA_RSS  = os.getenv("EXTRA_RSS", "").strip()
-FEEDS = [u.strip() for u in (FEEDS_ENV + ("," if FEEDS_ENV and EXTRA_RSS else "") + EXTRA_RSS).split(",") if u.strip()]
-if not FEEDS:
-    FEEDS = [
-        "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",          # WSJ Markets
-        "https://www.cnbc.com/id/100003114/device/rss/rss.html",  # CNBC Top
-        "https://www.reuters.com/rssFeed/businessNews",           # Reuters Business
-    ]
+
+# A fast default mix. You can override/extend via FEEDS / EXTRA_RSS env vars.
+DEFAULT_FEEDS = [
+    # CNBC Top News (fast, US markets)
+    "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+    # Reuters Business
+    "https://www.reuters.com/rssFeed/businessNews",
+    # MarketWatch Top Stories
+    "https://www.marketwatch.com/rss/topstories",
+    # Investing.com latest news (often very fast)
+    "https://www.investing.com/rss/news.rss",
+    # BBC Business (global)
+    "https://feeds.bbci.co.uk/news/business/rss.xml",
+    # Nasdaq Market News
+    "https://www.nasdaq.com/feed/rssoutbound?category=MarketNews",
+    # WSJ Markets (can be slower, but relevant)
+    "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
+]
+
+FEEDS = [u.strip() for u in (FEEDS_ENV if FEEDS_ENV else ",".join(DEFAULT_FEEDS)).split(",") if u.strip()]
+if EXTRA_RSS:
+    FEEDS += [u.strip() for u in EXTRA_RSS.split(",") if u.strip()]
 
 KEYWORDS_ENV = os.getenv("KEYWORDS", "")
 HIGH_IMPACT_TERMS = [k.strip().lower() for k in KEYWORDS_ENV.split(",") if k.strip()] or [
@@ -124,7 +147,7 @@ UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, 
 
 def extract_article_text(url: str) -> tuple[str, datetime | None]:
     """
-    Return (main_text, published_dt_utc or None) using BeautifulSoup (no lxml/readability).
+    Return (main_text, published_dt_utc or None) using BeautifulSoup (no native deps).
     """
     if not url:
         return "", None
@@ -134,24 +157,25 @@ def extract_article_text(url: str) -> tuple[str, datetime | None]:
         html = r.text
         full = BeautifulSoup(html, "html.parser")
 
-        # Prefer <article> content if present
+        # Prefer <article> content
         text_chunks: list[str] = []
         art = full.find("article")
         if art:
             for p in art.find_all(["p","li"]):
                 txt = p.get_text(" ", strip=True)
-                if len(txt) >= 50:
+                if len(txt) >= 60:
                     text_chunks.append(txt)
-        # Fallback: long <p> elements on page
+
+        # Fallback: long paragraphs across page
         if len(" ".join(text_chunks)) < 300:
             for p in full.find_all("p"):
                 txt = p.get_text(" ", strip=True)
-                if len(txt) >= 80:
+                if len(txt) >= 100:
                     text_chunks.append(txt)
-            # Trim mega-long pages
+
         article_text = " ".join(text_chunks)[:5000]
 
-        # Try to extract published time from common meta tags
+        # Try meta publish time
         published = None
         try:
             meta_candidates = [
@@ -209,16 +233,17 @@ def published_dt_from_entry(entry, link_html_published=None) -> datetime | None:
         return link_html_published
     return None
 
-# ---------- AI classification with article context ----------
+# ---------- AI classification with stronger stance ----------
 def ai_classify(title: str, source: str, article_text: str):
     ctx = article_text[:4000] if article_text else ""
     system = (
         "You are a senior macro/market analyst advising a NASDAQ day trader. "
-        "Read the provided article context (if any) and the headline. "
-        "Give a crisp <=25-word summary that does NOT repeat the headline verbatim. "
-        "Read between the lines for market-relevant implications and risks (avoid unfounded speculation). "
+        "Read the article context (if any) and the headline. "
+        "Deliver a crisp <=25-word market takeaway that does NOT repeat the headline verbatim. "
+        "When evidence suggests direction, prefer a decisive classification (Bullish or Bearish). "
+        "Choose Neutral ONLY if there is truly no directional signal in the next 1–3 sessions. "
         "Classify overall impact on NASDAQ as Bullish, Bearish, or Neutral. "
-        "Provide a confidence 0-100, and 1-3 tags chosen from: "
+        "Provide a confidence 0–100. Include 1–3 tags chosen from: "
         "Tariff, China, Fed, CPI, NFP, Regulation, War, Energy, AI, Earnings, Sanctions, Rates, Yields, FX. "
         "Return JSON ONLY with keys: summary, sentiment, confidence, tags."
     )
@@ -253,8 +278,10 @@ def ai_classify(title: str, source: str, article_text: str):
 # =========================
 # Fetch & process
 # =========================
-def fetch_once(limit_per_feed=6):
+def fetch_once(limit_per_feed=8):
     global seen
+
+    # 1) Pull entries
     items = []
     for url in FEEDS:
         try:
@@ -269,15 +296,34 @@ def fetch_once(limit_per_feed=6):
         except Exception as e:
             print("Feed error:", url, e)
 
-    seen_now = set()
+    # 2) Precompute publish times for sorting, then sort newest first
+    enriched = []
     for it in items:
+        dt_from_rss = published_dt_from_entry(it["entry"], None)
+        enriched.append((dt_from_rss, it))
+    enriched.sort(key=lambda x: x[0] or datetime.now(timezone.utc), reverse=True)
+
+    # 3) Iterate and post (fresh-only, dedup, optional cap per cycle)
+    posted = 0
+    seen_now = set()
+    for dt_rss, it in enriched:
         uid = make_uid(it["title"])
         if uid in seen or uid in seen_now:
             continue
         if not looks_relevant(it["title"]):
             continue
 
+        # Extract article + possibly better publish time from page
         article_text, published_from_html = extract_article_text(it["link"])
+        dt_utc = published_dt_from_entry(it["entry"], published_from_html) or dt_rss
+        if not dt_utc:
+            dt_utc = datetime.now(timezone.utc)
+
+        # Freshness filter: <= MAX_AGE_HOURS
+        now_utc = datetime.now(timezone.utc)
+        if dt_utc and (now_utc - dt_utc) > timedelta(hours=MAX_AGE_HOURS):
+            continue
+
         ai = ai_classify(it["title"], it["source"], article_text)
 
         if HIDE_NEUTRAL and ai["sentiment"] == "Neutral":
@@ -285,25 +331,28 @@ def fetch_once(limit_per_feed=6):
         if ai["confidence"] < MIN_CONFIDENCE:
             continue
 
-        dt_utc = published_dt_from_entry(it["entry"], published_from_html)
-        if not dt_utc:
-            dt_utc = datetime.now(timezone.utc)
+        # Time formatting
         dt_est = dt_utc.astimezone(ZoneInfo("America/New_York"))
-        when = dt_est.strftime("%-I:%M %p EST • %b %-d")
+        minutes_ago = int((now_utc - dt_utc).total_seconds() // 60)
+        ago_str = f"{minutes_ago} min ago" if minutes_ago < 90 else f"{minutes_ago//60} hr ago"
+        when = f"{dt_est.strftime('%-I:%M %p EST • %b %-d')} ({ago_str})"
 
+        # Summary fallback + avoid duplication with title
         summary = (ai.get("summary") or "").strip()
+        if not summary:
+            summary = "No clear body text. Likely headline-driven; watch for price action confirmation."
         if summary.lower() == it["title"].strip().lower():
-            summary = ""
+            summary = "Market takeaway based on headline: possible near-term volatility; monitor futures/tech leaders."
 
+        # Source line + hyperlink
         if it["link"]:
             src_line = f'🔗 Source: <a href="{html_escape(it["link"])}">{html_escape(it["source"])}</a>'
         else:
-            src_line = f"🔗 Source: {html_escape(it["source"])}"
+            src_line = f"🔗 Source: {html_escape(it['source'])}"
 
-        summary_line = f"✍️ {html_escape(summary)}\n" if summary else ""
         msg = (
             f"📰 {html_escape(it['title'])}\n"
-            f"{summary_line}"
+            f"✍️ {html_escape(summary)}\n"
             f"{format_sentiment(ai)}\n"
             f"{src_line}\n"
             f"🕒 {html_escape(when)}"
@@ -311,14 +360,19 @@ def fetch_once(limit_per_feed=6):
 
         send_message(msg)
         seen_now.add(uid)
-        time.sleep(1)
+        posted += 1
+        if posted % 1 == 0:
+            time.sleep(1)  # small pacing
+
+        if MAX_POSTS_PER_CYCLE > 0 and posted >= MAX_POSTS_PER_CYCLE:
+            break
 
     if seen_now:
         seen |= seen_now
         save_seen(seen)
 
 def main():
-    send_message("✅ SmartFlow News worker started.")
+    send_message("✅ SmartFlow News worker started (fresh ≤ 2 hours).")
     backoff = 5
     while True:
         try:
