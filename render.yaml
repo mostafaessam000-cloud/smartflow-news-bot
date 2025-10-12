@@ -1,0 +1,17 @@
+services:
+  - type: worker
+    name: smartflow-news
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python bot.py"
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: SLEEP_SECONDS
+        value: "60"
+      - key: FEEDS
+        value: "https://feeds.a.dj.com/rss/RSSMarketsMain.xml,https://www.cnbc.com/id/100003114/device/rss/rss.html,https://www.reuters.com/rssFeed/businessNews"
