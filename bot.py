@@ -15,9 +15,9 @@ SLEEP_SECONDS    = int(os.getenv("SLEEP_SECONDS", "60"))
 MIN_CONFIDENCE   = int(os.getenv("MIN_CONFIDENCE", "0"))          # e.g. 70
 HIDE_NEUTRAL     = os.getenv("HIDE_NEUTRAL", "false").lower() in ("1","true","yes")
 
-# Feeds
+# Feeds (add extra RSS like X/Truth via EXTRA_RSS)
 FEEDS_ENV  = os.getenv("FEEDS", "").strip()
-EXTRA_RSS  = os.getenv("EXTRA_RSS", "").strip()  # put X/Truth RSS here if you have them
+EXTRA_RSS  = os.getenv("EXTRA_RSS", "").strip()
 FEEDS = [u.strip() for u in (FEEDS_ENV + ("," if FEEDS_ENV and EXTRA_RSS else "") + EXTRA_RSS).split(",") if u.strip()]
 if not FEEDS:
     FEEDS = [
@@ -37,7 +37,7 @@ HIGH_IMPACT_TERMS = [k.strip().lower() for k in KEYWORDS_ENV.split(",") if k.str
 assert TELEGRAM_TOKEN and TELEGRAM_CHAT_ID and OPENAI_API_KEY, \
     "Missing env vars: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, OPENAI_API_KEY"
 
-# OpenAI client (httpx avoids proxy kwarg issue)
+# OpenAI client (httpx avoids unsupported 'proxies' kwarg path)
 client = OpenAI(
     api_key=OPENAI_API_KEY,
     http_client=httpx.Client(follow_redirects=True)
@@ -60,7 +60,6 @@ def load_seen():
     return set()
 
 def save_seen(s: set):
-    # trim to recent N
     if len(s) > SEEN_LIMIT:
         s = set(list(s)[-SEEN_LIMIT:])
     with open(SEEN_PATH, "w", encoding="utf-8") as f:
@@ -87,22 +86,49 @@ def looks_relevant(title: str) -> bool:
     t = (title or "").lower()
     return any(k in t for k in HIGH_IMPACT_TERMS)
 
+def html_escape(s: str) -> str:
+    return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
 def send_message(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        requests.get(url, params={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}, timeout=20)
+        requests.get(
+            url,
+            params={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",              # enable HTML formatting
+                "disable_web_page_preview": True,
+            },
+            timeout=20,
+        )
     except Exception as e:
         print("Telegram error:", e)
 
+def format_sentiment(ai: dict) -> str:
+    s = (ai.get("sentiment") or "Neutral").title()
+    try:
+        conf = int(float(ai.get("confidence", 60)))
+    except Exception:
+        conf = 60
+    if s == "Neutral":
+        # yellow box, no percentage
+        return "🟨 Neutral"
+    elif s == "Bearish":
+        # red down arrow, bold word + percentage
+        return f"🔻 <b>Bearish</b> ({conf}%)"
+    else:  # Bullish
+        # green up arrow, bold word + percentage
+        return f"🔺 <b>Bullish</b> ({conf}%)"
+
 def ai_classify(title: str, source: str):
     system = (
-    "You are a fast market analyst for a NASDAQ trader. "
-    "Summarize the headline in <=25 words **without repeating it verbatim**. "
-    "Explain its market impact briefly and classify the overall impact on NASDAQ as "
-    "Bullish, Bearish, or Neutral. Give confidence 0-100 and 1-3 tags "
-    "(Tariff, China, Fed, CPI, NFP, Regulation, War, Energy, AI, Earnings, Sanctions, Rates, Yields, FX). "
-    "Return JSON with keys: summary, sentiment, confidence, tags."
-)
+        "You are a fast market analyst for a NASDAQ trader. "
+        "Summarize the headline in <=25 words WITHOUT repeating it verbatim. "
+        "Explain the likely impact on NASDAQ briefly and classify as Bullish, Bearish, or Neutral. "
+        "Give confidence 0-100 and 1-3 tags (Tariff, China, Fed, CPI, NFP, Regulation, War, Energy, AI, Earnings, "
+        "Sanctions, Rates, Yields, FX). Return JSON only with keys: summary, sentiment, confidence, tags."
+    )
     user = f"Source: {source}\nHeadline: {title}\nReturn JSON only."
     try:
         resp = client.chat.completions.create(
@@ -160,6 +186,7 @@ def fetch_once(limit_per_feed=6):
             continue
 
         ai = ai_classify(it["title"], it["source"])
+
         # Optional filters
         if HIDE_NEUTRAL and ai["sentiment"] == "Neutral":
             continue
@@ -167,15 +194,27 @@ def fetch_once(limit_per_feed=6):
             continue
 
         ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
-        src_line = f"🔗 Source: {it['source']}" + (f" — {it['link']}" if it['link'] else "")
+
+        # avoid showing a summary identical to the title
+        summary = (ai.get("summary") or "").strip()
+        title_norm   = it["title"].strip().lower()
+        summary_norm = summary.lower()
+        summary_line = "" if summary_norm == title_norm else f"✍️ {html_escape(summary)}\n"
+
+        # source line + hyperlink if link exists
+        if it["link"]:
+            src_line = f'🔗 Source: <a href="{html_escape(it["link"])}">{html_escape(it["source"])}</a>'
+        else:
+            src_line = f"🔗 Source: {html_escape(it['source'])}"
+
         msg = (
-            f"📰 {it['title']}\n"
-            f"✍️ {ai['summary']}\n"
-            f"📊 Sentiment: {ai['sentiment']} ({ai['confidence']}%)"
-            + (f"\n🏷️ Tags: {', '.join(ai['tags'])}" if ai['tags'] else "")
-            + f"\n{src_line}"
-            + f"\n⏱️ {ts}"
+            f"📰 {html_escape(it['title'])}\n"
+            f"{summary_line}"
+            f"{format_sentiment(ai)}\n"
+            f"{src_line}\n"
+            f"⏱️ {html_escape(ts)}"
         )
+
         send_message(msg)
         seen_now.add(uid)
         time.sleep(1)
