@@ -1,7 +1,12 @@
 import os, re, time, json, hashlib, feedparser, requests
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from openai import OpenAI
 import httpx
+
+# for article extraction
+from readability import Document
+from bs4 import BeautifulSoup
 
 # =========================
 # Env & Settings
@@ -40,7 +45,7 @@ assert TELEGRAM_TOKEN and TELEGRAM_CHAT_ID and OPENAI_API_KEY, \
 # OpenAI client (httpx avoids unsupported 'proxies' kwarg path)
 client = OpenAI(
     api_key=OPENAI_API_KEY,
-    http_client=httpx.Client(follow_redirects=True)
+    http_client=httpx.Client(follow_redirects=True, timeout=20),
 )
 
 # =========================
@@ -121,15 +126,120 @@ def format_sentiment(ai: dict) -> str:
         # green up arrow, bold word + percentage
         return f"🔺 <b>Bullish</b> ({conf}%)"
 
-def ai_classify(title: str, source: str):
+# ---------- Article extraction ----------
+
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"}
+
+def extract_article_text(url: str) -> tuple[str, datetime | None]:
+    """
+    Return (main_text, published_dt_utc or None).
+    Uses readability + BeautifulSoup; safe fallbacks on failure.
+    """
+    if not url:
+        return "", None
+    try:
+        r = requests.get(url, headers=UA, timeout=12)
+        r.raise_for_status()
+        html = r.text
+
+        # Try readability for main content
+        doc = Document(html)
+        summary_html = doc.summary()
+        soup = BeautifulSoup(summary_html, "lxml")
+        # get a solid chunk of text
+        paras = [p.get_text(" ", strip=True) for p in soup.find_all(["p","li"]) if p.get_text(strip=True)]
+        article_text = " ".join(paras)
+        if len(article_text) < 300:  # too short? try full page fallbacks
+            full = BeautifulSoup(html, "lxml")
+            # look for <article> or long paragraphs
+            art = full.find("article")
+            if art:
+                paras = [p.get_text(" ", strip=True) for p in art.find_all(["p","li"]) if p.get_text(strip=True)]
+            else:
+                paras = [p.get_text(" ", strip=True) for p in full.find_all("p") if len(p.get_text(strip=True)) > 60]
+            article_text = " ".join(paras)[:5000]
+
+        # Try to extract published time from meta tags
+        published = None
+        try:
+            full = BeautifulSoup(html, "lxml")
+            meta_candidates = [
+                ("meta", {"property":"article:published_time"}),
+                ("meta", {"name":"article:published_time"}),
+                ("meta", {"name":"pubdate"}),
+                ("meta", {"property":"og:updated_time"}),
+                ("meta", {"property":"og:published_time"}),
+                ("time", {"datetime": True}),
+            ]
+            for tag, attrs in meta_candidates:
+                el = full.find(tag, attrs=attrs)
+                if el and (el.get("content") or el.get("datetime")):
+                    ts = el.get("content") or el.get("datetime")
+                    published = parse_any_ts(ts)
+                    if published:
+                        break
+        except Exception:
+            pass
+
+        return article_text.strip(), published
+    except Exception as e:
+        print("extract_article_text error:", e)
+        return "", None
+
+def parse_any_ts(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    s = s.strip()
+    # very lenient parser for common formats
+    try:
+        # try fromisoformat first
+        dt = datetime.fromisoformat(s.replace("Z","+00:00"))
+        if not dt.tzinfo:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        pass
+    # RFC-like formats from some sites
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(s)
+        if not dt.tzinfo:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def published_dt_from_entry(entry, link_html_published=None) -> datetime | None:
+    # 1) RSS published/updated
+    for attr in ("published_parsed","updated_parsed"):
+        t = getattr(entry, attr, None)
+        if t:
+            try:
+                dt = datetime(*t[:6], tzinfo=timezone.utc)
+                return dt
+            except Exception:
+                pass
+    # 2) From article HTML meta if provided
+    if link_html_published:
+        return link_html_published
+    return None
+
+# ---------- AI classification with full article context ----------
+def ai_classify(title: str, source: str, article_text: str):
+    # Trim text to keep tokens reasonable
+    ctx = article_text[:4000] if article_text else ""
     system = (
-        "You are a fast market analyst for a NASDAQ trader. "
-        "Summarize the headline in <=25 words WITHOUT repeating it verbatim. "
-        "Explain the likely impact on NASDAQ briefly and classify as Bullish, Bearish, or Neutral. "
-        "Give confidence 0-100 and 1-3 tags (Tariff, China, Fed, CPI, NFP, Regulation, War, Energy, AI, Earnings, "
-        "Sanctions, Rates, Yields, FX). Return JSON only with keys: summary, sentiment, confidence, tags."
+        "You are a senior macro/market analyst advising a NASDAQ day trader. "
+        "Read the provided article context (if any) and the headline. "
+        "Give a crisp <=25-word summary that does NOT repeat the headline verbatim. "
+        "Read between the lines for market-relevant implications and risks (but avoid unfounded speculation). "
+        "Classify overall impact on NASDAQ as Bullish, Bearish, or Neutral. "
+        "Provide a confidence 0-100, and 1-3 tags chosen from: "
+        "Tariff, China, Fed, CPI, NFP, Regulation, War, Energy, AI, Earnings, Sanctions, Rates, Yields, FX. "
+        "Return JSON ONLY with keys: summary, sentiment, confidence, tags."
     )
-    user = f"Source: {source}\nHeadline: {title}\nReturn JSON only."
+    user = f"Source: {source}\nHeadline: {title}\nArticle context:\n{ctx}\nReturn JSON only."
+
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -172,7 +282,7 @@ def fetch_once(limit_per_feed=6):
                 link  = (getattr(entry, "link", "") or "").strip()
                 if not title:
                     continue
-                items.append({"source": src, "title": title, "link": link})
+                items.append({"source": src, "title": title, "link": link, "entry": entry})
         except Exception as e:
             print("Feed error:", url, e)
 
@@ -185,7 +295,8 @@ def fetch_once(limit_per_feed=6):
         if not looks_relevant(it["title"]):
             continue
 
-        ai = ai_classify(it["title"], it["source"])
+        article_text, published_from_html = extract_article_text(it["link"])
+        ai = ai_classify(it["title"], it["source"], article_text)
 
         # Optional filters
         if HIDE_NEUTRAL and ai["sentiment"] == "Neutral":
@@ -193,13 +304,17 @@ def fetch_once(limit_per_feed=6):
         if ai["confidence"] < MIN_CONFIDENCE:
             continue
 
-        ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
+        # Published time (prefer feed/HTML time) → show as EST
+        dt_utc = published_dt_from_entry(it["entry"], published_from_html)
+        if not dt_utc:
+            dt_utc = datetime.now(timezone.utc)
+        dt_est = dt_utc.astimezone(ZoneInfo("America/New_York"))
+        when = dt_est.strftime("%-I:%M %p EST • %b %-d")  # e.g., 6:24 PM EST • Oct 12
 
-        # avoid showing a summary identical to the title
+        # avoid showing a summary identical to the title (unlikely now, but safe)
         summary = (ai.get("summary") or "").strip()
-        title_norm   = it["title"].strip().lower()
-        summary_norm = summary.lower()
-        summary_line = "" if summary_norm == title_norm else f"✍️ {html_escape(summary)}\n"
+        if summary.lower() == it["title"].strip().lower():
+            summary = ""
 
         # source line + hyperlink if link exists
         if it["link"]:
@@ -207,12 +322,13 @@ def fetch_once(limit_per_feed=6):
         else:
             src_line = f"🔗 Source: {html_escape(it['source'])}"
 
+        summary_line = f"✍️ {html_escape(summary)}\n" if summary else ""
         msg = (
             f"📰 {html_escape(it['title'])}\n"
             f"{summary_line}"
             f"{format_sentiment(ai)}\n"
             f"{src_line}\n"
-            f"⏱️ {html_escape(ts)}"
+            f"🕒 {html_escape(when)}"
         )
 
         send_message(msg)
