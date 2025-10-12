@@ -1,6 +1,13 @@
 import os, time, json, hashlib, feedparser, requests
 from datetime import datetime, timezone
 from openai import OpenAI
+import httpx
+
+# create a plain httpx client; avoids passing unsupported 'proxies' kwarg internally
+client = OpenAI(
+    api_key=OPENAI_API_KEY,
+    http_client=httpx.Client(follow_redirects=True)
+)
 
 # -------- settings from environment --------
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
@@ -27,7 +34,7 @@ HIGH_IMPACT_TERMS = [k.strip().lower() for k in KEYWORDS_ENV.split(",") if k.str
 assert TELEGRAM_TOKEN and TELEGRAM_CHAT_ID and OPENAI_API_KEY, \
     "Missing env vars: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, OPENAI_API_KEY"
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+
 SEEN_PATH = "seen.txt"
 seen = set()
 
