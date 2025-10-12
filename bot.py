@@ -3,12 +3,6 @@ from datetime import datetime, timezone
 from openai import OpenAI
 import httpx
 
-# create a plain httpx client; avoids passing unsupported 'proxies' kwarg internally
-client = OpenAI(
-    api_key=OPENAI_API_KEY,
-    http_client=httpx.Client(follow_redirects=True)
-)
-
 # -------- settings from environment --------
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -34,6 +28,11 @@ HIGH_IMPACT_TERMS = [k.strip().lower() for k in KEYWORDS_ENV.split(",") if k.str
 assert TELEGRAM_TOKEN and TELEGRAM_CHAT_ID and OPENAI_API_KEY, \
     "Missing env vars: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, OPENAI_API_KEY"
 
+# ---- OpenAI client (after env vars are loaded) ----
+client = OpenAI(
+    api_key=OPENAI_API_KEY,
+    http_client=httpx.Client(follow_redirects=True)  # avoid unsupported 'proxies' kwarg path
+)
 
 SEEN_PATH = "seen.txt"
 seen = set()
@@ -70,7 +69,7 @@ def ai_classify(title: str, source: str):
     user = f"Source: {source}\nHeadline: {title}\nReturn JSON only."
     try:
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",             # fast & cost-effective
+            model="gpt-4o-mini",  # fast & cost-effective
             messages=[{"role":"system","content":system},
                       {"role":"user","content":user}],
             temperature=0.2,
@@ -84,11 +83,12 @@ def ai_classify(title: str, source: str):
         }
         data["sentiment"]  = str(data.get("sentiment","Neutral")).title()
         data["confidence"] = int(float(data.get("confidence", 60)))
-        if not isinstance(data.get("tags", []), list): data["tags"] = []
+        if not isinstance(data.get("tags", []), list):
+            data["tags"] = []
         return data
     except Exception as e:
         print("AI error:", e)
-        return {"summary": title, "sentiment":"Neutral","confidence":50,"tags":[]}
+        return {"summary": title, "sentiment": "Neutral", "confidence": 50, "tags": []}
 
 def fetch_once(limit_per_feed=3):
     for url in FEEDS:
@@ -97,7 +97,7 @@ def fetch_once(limit_per_feed=3):
         for entry in feed.entries[:limit_per_feed]:
             title = entry.title.strip()
             uid = hashlib.sha1(f"{src}||{title}".encode("utf-8")).hexdigest()
-            if uid in seen: 
+            if uid in seen:
                 continue
             if not looks_relevant(title):
                 continue
