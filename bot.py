@@ -3,9 +3,6 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from openai import OpenAI
 import httpx
-
-# for article extraction
-from readability import Document
 from bs4 import BeautifulSoup
 
 # =========================
@@ -42,7 +39,7 @@ HIGH_IMPACT_TERMS = [k.strip().lower() for k in KEYWORDS_ENV.split(",") if k.str
 assert TELEGRAM_TOKEN and TELEGRAM_CHAT_ID and OPENAI_API_KEY, \
     "Missing env vars: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, OPENAI_API_KEY"
 
-# OpenAI client (httpx avoids unsupported 'proxies' kwarg path)
+# OpenAI client
 client = OpenAI(
     api_key=OPENAI_API_KEY,
     http_client=httpx.Client(follow_redirects=True, timeout=20),
@@ -51,8 +48,8 @@ client = OpenAI(
 # =========================
 # Dedup storage
 # =========================
-SEEN_PATH = "seen.json"         # store hashes here
-SEEN_LIMIT = 5000               # keep last N items
+SEEN_PATH = "seen.json"
+SEEN_LIMIT = 5000
 
 def load_seen():
     if os.path.exists(SEEN_PATH):
@@ -75,7 +72,7 @@ seen = load_seen()
 # =========================
 # Helpers
 # =========================
-_norm_re = re.compile(r"[^\w\s]")  # remove punctuation
+_norm_re = re.compile(r"[^\w\s]")
 
 def normalize_title(t: str) -> str:
     t = (t or "").strip().lower()
@@ -84,7 +81,6 @@ def normalize_title(t: str) -> str:
     return t
 
 def make_uid(title: str) -> str:
-    # Hash ONLY the normalized title so duplicates across different feeds collapse
     return hashlib.sha1(normalize_title(title).encode("utf-8")).hexdigest()
 
 def looks_relevant(title: str) -> bool:
@@ -102,7 +98,7 @@ def send_message(text: str):
             params={
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": text,
-                "parse_mode": "HTML",              # enable HTML formatting
+                "parse_mode": "HTML",
                 "disable_web_page_preview": True,
             },
             timeout=20,
@@ -117,23 +113,18 @@ def format_sentiment(ai: dict) -> str:
     except Exception:
         conf = 60
     if s == "Neutral":
-        # yellow box, no percentage
         return "🟨 Neutral"
     elif s == "Bearish":
-        # red down arrow, bold word + percentage
         return f"🔻 <b>Bearish</b> ({conf}%)"
-    else:  # Bullish
-        # green up arrow, bold word + percentage
+    else:
         return f"🔺 <b>Bullish</b> ({conf}%)"
 
-# ---------- Article extraction ----------
-
+# ---------- Article extraction (BeautifulSoup only) ----------
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"}
 
 def extract_article_text(url: str) -> tuple[str, datetime | None]:
     """
-    Return (main_text, published_dt_utc or None).
-    Uses readability + BeautifulSoup; safe fallbacks on failure.
+    Return (main_text, published_dt_utc or None) using BeautifulSoup (no lxml/readability).
     """
     if not url:
         return "", None
@@ -141,28 +132,28 @@ def extract_article_text(url: str) -> tuple[str, datetime | None]:
         r = requests.get(url, headers=UA, timeout=12)
         r.raise_for_status()
         html = r.text
+        full = BeautifulSoup(html, "html.parser")
 
-        # Try readability for main content
-        doc = Document(html)
-        summary_html = doc.summary()
-        soup = BeautifulSoup(summary_html, "lxml")
-        # get a solid chunk of text
-        paras = [p.get_text(" ", strip=True) for p in soup.find_all(["p","li"]) if p.get_text(strip=True)]
-        article_text = " ".join(paras)
-        if len(article_text) < 300:  # too short? try full page fallbacks
-            full = BeautifulSoup(html, "lxml")
-            # look for <article> or long paragraphs
-            art = full.find("article")
-            if art:
-                paras = [p.get_text(" ", strip=True) for p in art.find_all(["p","li"]) if p.get_text(strip=True)]
-            else:
-                paras = [p.get_text(" ", strip=True) for p in full.find_all("p") if len(p.get_text(strip=True)) > 60]
-            article_text = " ".join(paras)[:5000]
+        # Prefer <article> content if present
+        text_chunks: list[str] = []
+        art = full.find("article")
+        if art:
+            for p in art.find_all(["p","li"]):
+                txt = p.get_text(" ", strip=True)
+                if len(txt) >= 50:
+                    text_chunks.append(txt)
+        # Fallback: long <p> elements on page
+        if len(" ".join(text_chunks)) < 300:
+            for p in full.find_all("p"):
+                txt = p.get_text(" ", strip=True)
+                if len(txt) >= 80:
+                    text_chunks.append(txt)
+            # Trim mega-long pages
+        article_text = " ".join(text_chunks)[:5000]
 
-        # Try to extract published time from meta tags
+        # Try to extract published time from common meta tags
         published = None
         try:
-            full = BeautifulSoup(html, "lxml")
             meta_candidates = [
                 ("meta", {"property":"article:published_time"}),
                 ("meta", {"name":"article:published_time"}),
@@ -190,16 +181,13 @@ def parse_any_ts(s: str | None) -> datetime | None:
     if not s:
         return None
     s = s.strip()
-    # very lenient parser for common formats
     try:
-        # try fromisoformat first
         dt = datetime.fromisoformat(s.replace("Z","+00:00"))
         if not dt.tzinfo:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
     except Exception:
         pass
-    # RFC-like formats from some sites
     try:
         from email.utils import parsedate_to_datetime
         dt = parsedate_to_datetime(s)
@@ -210,29 +198,25 @@ def parse_any_ts(s: str | None) -> datetime | None:
         return None
 
 def published_dt_from_entry(entry, link_html_published=None) -> datetime | None:
-    # 1) RSS published/updated
     for attr in ("published_parsed","updated_parsed"):
         t = getattr(entry, attr, None)
         if t:
             try:
-                dt = datetime(*t[:6], tzinfo=timezone.utc)
-                return dt
+                return datetime(*t[:6], tzinfo=timezone.utc)
             except Exception:
                 pass
-    # 2) From article HTML meta if provided
     if link_html_published:
         return link_html_published
     return None
 
-# ---------- AI classification with full article context ----------
+# ---------- AI classification with article context ----------
 def ai_classify(title: str, source: str, article_text: str):
-    # Trim text to keep tokens reasonable
     ctx = article_text[:4000] if article_text else ""
     system = (
         "You are a senior macro/market analyst advising a NASDAQ day trader. "
         "Read the provided article context (if any) and the headline. "
         "Give a crisp <=25-word summary that does NOT repeat the headline verbatim. "
-        "Read between the lines for market-relevant implications and risks (but avoid unfounded speculation). "
+        "Read between the lines for market-relevant implications and risks (avoid unfounded speculation). "
         "Classify overall impact on NASDAQ as Bullish, Bearish, or Neutral. "
         "Provide a confidence 0-100, and 1-3 tags chosen from: "
         "Tariff, China, Fed, CPI, NFP, Regulation, War, Energy, AI, Earnings, Sanctions, Rates, Yields, FX. "
@@ -271,7 +255,6 @@ def ai_classify(title: str, source: str, article_text: str):
 # =========================
 def fetch_once(limit_per_feed=6):
     global seen
-    # Collect entries from all feeds first so de-dupe works across the union
     items = []
     for url in FEEDS:
         try:
@@ -286,7 +269,6 @@ def fetch_once(limit_per_feed=6):
         except Exception as e:
             print("Feed error:", url, e)
 
-    # Iterate unique by title-hash
     seen_now = set()
     for it in items:
         uid = make_uid(it["title"])
@@ -298,29 +280,25 @@ def fetch_once(limit_per_feed=6):
         article_text, published_from_html = extract_article_text(it["link"])
         ai = ai_classify(it["title"], it["source"], article_text)
 
-        # Optional filters
         if HIDE_NEUTRAL and ai["sentiment"] == "Neutral":
             continue
         if ai["confidence"] < MIN_CONFIDENCE:
             continue
 
-        # Published time (prefer feed/HTML time) → show as EST
         dt_utc = published_dt_from_entry(it["entry"], published_from_html)
         if not dt_utc:
             dt_utc = datetime.now(timezone.utc)
         dt_est = dt_utc.astimezone(ZoneInfo("America/New_York"))
-        when = dt_est.strftime("%-I:%M %p EST • %b %-d")  # e.g., 6:24 PM EST • Oct 12
+        when = dt_est.strftime("%-I:%M %p EST • %b %-d")
 
-        # avoid showing a summary identical to the title (unlikely now, but safe)
         summary = (ai.get("summary") or "").strip()
         if summary.lower() == it["title"].strip().lower():
             summary = ""
 
-        # source line + hyperlink if link exists
         if it["link"]:
             src_line = f'🔗 Source: <a href="{html_escape(it["link"])}">{html_escape(it["source"])}</a>'
         else:
-            src_line = f"🔗 Source: {html_escape(it['source'])}"
+            src_line = f"🔗 Source: {html_escape(it["source"])}"
 
         summary_line = f"✍️ {html_escape(summary)}\n" if summary else ""
         msg = (
