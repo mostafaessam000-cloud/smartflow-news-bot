@@ -96,12 +96,13 @@ def send_message(text: str):
 
 def ai_classify(title: str, source: str):
     system = (
-        "You are a fast market analyst for a NASDAQ trader. "
-        "In <=25 words, summarize the headline and classify overall impact on NASDAQ as "
-        "Bullish, Bearish, or Neutral. Give confidence 0-100 and 1-3 tags "
-        "(Tariff, China, Fed, CPI, NFP, Regulation, War, Energy, AI, Earnings, Sanctions, Rates, Yields, FX). "
-        "Return JSON with keys: summary, sentiment, confidence, tags."
-    )
+    "You are a fast market analyst for a NASDAQ trader. "
+    "Summarize the headline in <=25 words **without repeating it verbatim**. "
+    "Explain its market impact briefly and classify the overall impact on NASDAQ as "
+    "Bullish, Bearish, or Neutral. Give confidence 0-100 and 1-3 tags "
+    "(Tariff, China, Fed, CPI, NFP, Regulation, War, Energy, AI, Earnings, Sanctions, Rates, Yields, FX). "
+    "Return JSON with keys: summary, sentiment, confidence, tags."
+)
     user = f"Source: {source}\nHeadline: {title}\nReturn JSON only."
     try:
         resp = client.chat.completions.create(
