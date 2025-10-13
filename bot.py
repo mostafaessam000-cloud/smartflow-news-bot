@@ -1,6 +1,7 @@
 import os, re, time, json, hashlib, feedparser, requests
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
+from urllib.parse import urlparse
 from openai import OpenAI
 import httpx
 from bs4 import BeautifulSoup
@@ -18,23 +19,41 @@ MIN_CONFIDENCE   = int(os.getenv("MIN_CONFIDENCE", "0"))   # e.g., 70
 HIDE_NEUTRAL     = os.getenv("HIDE_NEUTRAL", "false").lower() in ("1","true","yes")
 MAX_POSTS_PER_CYCLE = int(os.getenv("MAX_POSTS_PER_CYCLE", "0"))  # 0 = unlimited
 
+# Keyword gate toggle (defaults to OFF to broaden sources)
+REQUIRE_KEYWORDS = os.getenv("REQUIRE_KEYWORDS", "false").lower() in ("1","true","yes")
+
 # Domains to NOT fetch (paywalls/anti-bot); still post from RSS
 SKIP_FETCH_DOMAINS = [
-    d.strip().lower() for d in os.getenv("SKIP_FETCH_DOMAINS", "wsj.com,cnbc.com").split(",") if d.strip()
+    d.strip().lower()
+    for d in os.getenv("SKIP_FETCH_DOMAINS", "wsj.com,ft.com,bloomberg.com").split(",")
+    if d.strip()
 ]
 
 # Feeds (override with FEEDS / extend with EXTRA_RSS)
 FEEDS_ENV  = os.getenv("FEEDS", "").strip()
 EXTRA_RSS  = os.getenv("EXTRA_RSS", "").strip()
 
+# Fast, broad, business/markets-heavy defaults
 DEFAULT_FEEDS = [
-    "https://www.cnbc.com/id/100003114/device/rss/rss.html",  # CNBC Top
-    "https://www.reuters.com/rssFeed/businessNews",            # Reuters Business
-    "https://www.marketwatch.com/rss/topstories",              # MarketWatch
-    "https://www.investing.com/rss/news.rss",                  # Investing.com
-    "https://feeds.bbci.co.uk/news/business/rss.xml",          # BBC Business
+    # Core finance/business (fast)
+    "https://www.reuters.com/rssFeed/businessNews",
+    "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+    "https://www.marketwatch.com/rss/topstories",
+    "https://www.investing.com/rss/news.rss",
+    "https://feeds.bbci.co.uk/news/business/rss.xml",
     "https://www.nasdaq.com/feed/rssoutbound?category=MarketNews",
-    "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",           # WSJ Markets
+
+    # Broader but timely finance/business
+    "https://finance.yahoo.com/news/rssindex",
+    "https://rss.cnn.com/rss/money_latest.rss",
+    "https://www.theguardian.com/us/business/rss",
+    "https://apnews.com/hub/business?output=rss",  # AP business
+    "https://www.cbsnews.com/moneywatch/rss/",     # CBS MoneyWatch
+    "https://abcnews.go.com/abcnews/topstories?format=xml", # ABC (general but timely)
+    "https://www.aljazeera.com/xml/rss/all.xml",   # Al Jazeera English (global)
+
+    # May be slower / paywalled but relevant (we still post via RSS if fetch blocked)
+    "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",  # WSJ Markets
 ]
 
 FEEDS = [u.strip() for u in (FEEDS_ENV if FEEDS_ENV else ",".join(DEFAULT_FEEDS)).split(",") if u.strip()]
@@ -97,11 +116,43 @@ def make_uid(title: str) -> str:
     return hashlib.sha1(normalize_title(title).encode("utf-8")).hexdigest()
 
 def looks_relevant(title: str) -> bool:
+    if not REQUIRE_KEYWORDS:
+        return True
     t = (title or "").lower()
     return any(k in t for k in HIGH_IMPACT_TERMS)
 
 def html_escape(s: str) -> str:
     return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+DOMAIN_LABELS = {
+    "reuters.com": "Reuters",
+    "cnbc.com": "CNBC",
+    "marketwatch.com": "MarketWatch",
+    "investing.com": "Investing.com",
+    "bbc.co.uk": "BBC",
+    "bbc.com": "BBC",
+    "nasdaq.com": "Nasdaq",
+    "wsj.com": "WSJ",
+    "finance.yahoo.com": "Yahoo Finance",
+    "yahoo.com": "Yahoo Finance",
+    "cnn.com": "CNN Business",
+    "apnews.com": "AP News",
+    "theguardian.com": "The Guardian",
+    "ft.com": "Financial Times",
+    "bloomberg.com": "Bloomberg",
+    "cbsnews.com": "CBS News / MoneyWatch",
+    "abcnews.go.com": "ABC News",
+    "aljazeera.com": "Al Jazeera English",
+}
+
+def publisher_from_link(link: str, fallback: str) -> str:
+    try:
+        host = urlparse(link).netloc.lower()
+        parts = host.split(".")
+        dom = ".".join(parts[-2:]) if len(parts) >= 2 else host
+        return DOMAIN_LABELS.get(dom, fallback)
+    except Exception:
+        return fallback
 
 def send_message(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -138,14 +189,13 @@ UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, 
 def extract_article_text(url: str) -> tuple[str, datetime | None]:
     """
     Try to fetch page & extract main text + publish time.
-    If blocked/paywalled (401/403), returns ("", None) but the caller will fall back to RSS summary.
+    If blocked/paywalled (401/403), returns ("", None); caller will use RSS summary fallback.
     """
     if not url:
         return "", None
 
     # Skip known paywalled/anti-bot domains (still post from RSS)
     try:
-        from urllib.parse import urlparse
         host = urlparse(url).netloc.lower()
         if any(d and d in host for d in SKIP_FETCH_DOMAINS):
             return "", None
@@ -349,18 +399,19 @@ def fetch_once(limit_per_feed=8):
         ago_str = f"{minutes_ago} min ago" if minutes_ago < 90 else f"{minutes_ago//60} hr ago"
         when = f"{dt_est.strftime('%-I:%M %p EST • %b %-d')} ({ago_str})"
 
+        # Friendly publisher
+        nice_src = publisher_from_link(it["link"], it["source"])
+        if it["link"]:
+            src_line = f'🔗 Source: <a href="{html_escape(it["link"])}">{html_escape(nice_src)}</a>'
+        else:
+            src_line = f"🔗 Source: {html_escape(nice_src)}"
+
         # Summary fallback + avoid duplication with title
         summary = (ai.get("summary") or "").strip()
         if not summary:
             summary = "Headline-driven; watch for confirmation in futures and mega-cap tech."
         if summary.lower() == it["title"].strip().lower():
-            summary = "Market takeaway: headline suggests near-term volatility; monitor QQQ/NQ leaders."
-
-        # Source line + hyperlink
-        if it["link"]:
-            src_line = f'🔗 Source: <a href="{html_escape(it["link"])}">{html_escape(it["source"])}</a>'
-        else:
-            src_line = f"🔗 Source: {html_escape(it["source"])}"
+            summary = "Market takeaway: headline implies near-term volatility; watch QQQ/NQ leaders."
 
         msg = (
             f"📰 {html_escape(it['title'])}\n"
@@ -383,7 +434,7 @@ def fetch_once(limit_per_feed=8):
         save_seen(seen)
 
 def main():
-    send_message("✅ SmartFlow News worker started (fresh ≤ 2 hours, RSS fallback enabled).")
+    send_message("✅ SmartFlow News worker started (fresh ≤ 2 hours, diverse feeds, RSS fallback).")
     backoff = 5
     while True:
         try:
