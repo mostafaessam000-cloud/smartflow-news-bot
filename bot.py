@@ -1,3 +1,4 @@
+# bot.py
 import os, time, json, hashlib, feedparser, requests, html, re
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
@@ -5,18 +6,27 @@ from zoneinfo import ZoneInfo
 from openai import OpenAI
 
 # ----------------- ENV -----------------
-TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
-OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
-SLEEP_SECONDS     = int(os.getenv("SLEEP_SECONDS", "60"))
-MAX_AGE_HOURS     = float(os.getenv("MAX_AGE_HOURS", "2"))
-MAX_POSTS_PER_CYCLE = int(os.getenv("MAX_POSTS_PER_CYCLE", "4"))  # 0 = unlimited
-EXTRA_RSS         = os.getenv("EXTRA_RSS", "").strip()
+TELEGRAM_TOKEN      = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID")
+OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY")
+SLEEP_SECONDS       = int(os.getenv("SLEEP_SECONDS", "60"))
+MAX_AGE_HOURS       = float(os.getenv("MAX_AGE_HOURS", "2"))
+MAX_POSTS_PER_CYCLE = int(os.getenv("MAX_POSTS_PER_CYCLE", "6"))   # 0 = unlimited
 
-# AI gating (tuned for NASDAQ-only)
-IMPACT_MIN        = int(os.getenv("IMPACT_MIN", "70"))
-CONF_MIN          = int(os.getenv("CONF_MIN", "60"))
-ALLOW_NEUTRAL     = os.getenv("ALLOW_NEUTRAL", "false").lower() in ("1","true","yes")
+# Main curated feeds (comma-separated)
+FEEDS = [u.strip() for u in os.getenv("FEEDS", "").split(",") if u.strip()]
+
+# Optional extra feeds (comma-separated) if you want to experiment later
+EXTRA_RSS = [u.strip() for u in os.getenv("EXTRA_RSS", "").split(",") if u.strip()]
+
+# Keep or disable ForexFactory USD feed (macro prints)
+USE_FF = os.getenv("USE_FF", "true").lower() in ("1","true","yes")
+FF_FEED = "https://www.forexfactory.com/ffcal_week_this.xml"
+
+# NASDAQ-only AI gate
+IMPACT_MIN    = int(os.getenv("IMPACT_MIN", "70"))
+CONF_MIN      = int(os.getenv("CONF_MIN", "60"))
+ALLOW_NEUTRAL = os.getenv("ALLOW_NEUTRAL", "false").lower() in ("1","true","yes")
 
 assert TELEGRAM_TOKEN and TELEGRAM_CHAT_ID and OPENAI_API_KEY, \
     "Missing env vars: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, OPENAI_API_KEY"
@@ -24,39 +34,30 @@ assert TELEGRAM_TOKEN and TELEGRAM_CHAT_ID and OPENAI_API_KEY, \
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ----------------- CONSTANTS -----------------
-
-# Forex Factory USD-only calendar (XML)
-FF_FEED = "https://www.forexfactory.com/ffcal_week_this.xml"
-
-# If you want a few optional US-market feeds when you’re ready (kept optional):
-DEFAULT_EXTRA = [
-    # keep empty by default; add via EXTRA_RSS env if you want more firehose later
-]
-
-# High-impact prefilter terms (US macro + market movers)
-HIGH_IMPACT_TERMS = [
-    # Macro prints
-    "cpi", "ppi", "pce", "nfp", "payrolls", "jobs", "unemployment", "ism",
-    "pmi", "gdp", "retail sales", "core inflation", "inflation",
-    # Fed / rates / yields / dollar
-    "fed", "powell", "fomc", "rate", "rates", "hike", "cut", "treasury",
-    "yield", "10-year", "10yr", "2-year", "dxy", "usd",
-    # Mega caps / semis / ai (NASDAQ sensitivity)
-    "nvidia", "nvda", "amd", "aapl", "apple", "msft", "meta", "goog", "alphabet",
-    "amazon", "amzn", "avgo", "broadcom", "intc", "arm", "semiconductor", "chip",
-    "ai", "gpu", "export control", "sanction", "entity list",
-    # Energy/geopolitics (can move NASDAQ through rates/liquidity)
-    "opec", "iran", "israel", "ukraine", "houthis", "strait"
-]
-
 EST = ZoneInfo("America/New_York")
 UTC = timezone.utc
+
+# NASDAQ movers vocabulary (tight but broad enough)
+HIGH_IMPACT_TERMS = [
+    # Macro / Fed / rates
+    "fed","powell","fomc","rate","rates","hike","cut",
+    "cpi","ppi","pce","nfp","jobs","payrolls","unemployment","ism","pmi","gdp","retail sales",
+    "treasury","yield","10-year","10yr","2-year","dxy","usd",
+    # Big tech / semis / ai
+    "nvidia","nvda","amd","aapl","apple","msft","meta","goog","alphabet",
+    "amazon","amzn","avgo","broadcom","intc","arm","semiconductor","chip","ai","gpu",
+    # Company catalysts
+    "downgrade","upgrade","price target","guidance","outlook",
+    "earnings","eps","revenue","beat","miss","layoff","strike","ceo","resigns","steps down",
+    "buyback","dividend","merger","acquisition","lbo","ftc","doj","sec","antitrust",
+    # Geopolitics / energy shocks
+    "opec","iran","israel","ukraine","houthis","strait","attack","sanction","export control"
+]
 
 SEEN_PATH = "seen.txt"
 seen = set()
 
 # ----------------- UTIL -----------------
-
 def load_seen():
     if os.path.exists(SEEN_PATH):
         with open(SEEN_PATH, "r", encoding="utf-8") as f:
@@ -90,7 +91,7 @@ def utc_to_est(dt: datetime | None) -> str:
 
 def is_fresh(utc_dt: datetime | None, max_age_hours: float) -> bool:
     if not utc_dt:
-        return True  # if no timestamp, allow but AI gate will catch noise
+        return True  # allow if missing; AI will still gate for relevance
     age = datetime.now(UTC) - utc_dt
     return age <= timedelta(hours=max_age_hours)
 
@@ -119,45 +120,8 @@ def format_sentiment_for_nasdaq(direction: str, conf: int) -> str:
     else:
         return f"🟨 Neutral for NASDAQ"
 
-# ----------------- FOREX FACTORY PARSER -----------------
-
-def parse_forex_factory_usd():
-    """
-    Returns list of dicts with keys: title, link, summary, source, published (UTC dt or None).
-    Filters to USD events only by heuristic: look for '(USD)' in title/description
-    """
-    out = []
-    try:
-        feed = feedparser.parse(FF_FEED)
-    except Exception as e:
-        print("FF parse error:", e)
-        return out
-
-    for e in getattr(feed, "entries", []):
-        title = (e.get("title") or "").strip()
-        summary = (e.get("summary") or e.get("description") or "").strip()
-        link = (e.get("link") or "").strip()
-        src = "ForexFactory (USD)"
-
-        # USD only (FF calendar shows "(USD)" often)
-        text = f"{title}\n{summary}".lower()
-        if "usd" not in text:
-            continue
-
-        pub = parse_pub(e.get("published"))
-        out.append({
-            "title": title,
-            "summary": summary,
-            "link": link,
-            "source": src,
-            "published": pub
-        })
-    return out
-
-def parse_extra_feeds(urls: list[str]):
-    """
-    Generic RSS fetcher for optional feeds you may add later via EXTRA_RSS.
-    """
+# ----------------- RSS PARSERS -----------------
+def parse_generic_feeds(urls: list[str]):
     out = []
     for url in urls:
         try:
@@ -180,22 +144,42 @@ def parse_extra_feeds(urls: list[str]):
             })
     return out
 
-# ----------------- PREFILTERS (NASDAQ focus) -----------------
+def parse_forex_factory_usd():
+    out = []
+    try:
+        feed = feedparser.parse(FF_FEED)
+    except Exception as e:
+        print("FF parse error:", e)
+        return out
 
+    for e in getattr(feed, "entries", []):
+        title = (e.get("title") or "").strip()
+        summary = (e.get("summary") or e.get("description") or "").strip()
+        link = (e.get("link") or "").strip()
+        src = "ForexFactory (USD)"
+
+        # USD-only heuristic
+        text = f"{title}\n{summary}".lower()
+        if "usd" not in text:
+            continue
+
+        pub = parse_pub(e.get("published"))
+        out.append({
+            "title": title,
+            "summary": summary,
+            "link": link,
+            "source": src,
+            "published": pub
+        })
+    return out
+
+# ----------------- PREFILTER -----------------
 def looks_relevant(title: str, summary: str) -> bool:
-    """
-    Heuristic: require NASDAQ-relevant terms in either title or summary.
-    (Forex Factory USD feed is already focused, but we reinforce.)
-    """
     txt = f"{title}\n{summary}".lower()
     return any(k in txt for k in HIGH_IMPACT_TERMS)
 
-# ----------------- AI CLASSIFIER (NASDAQ ONLY) -----------------
-
+# ----------------- AI CLASSIFIER -----------------
 def ai_classify_nasdaq(title: str, source: str, body: str):
-    """
-    Ask the model for NASDAQ-only trade impact with a strict rubric.
-    """
     ctx = (body or "")[:4000]
     system = (
         "You are a professional US equities day-trading news analyst for a NASDAQ scalper. "
@@ -208,11 +192,9 @@ def ai_classify_nasdaq(title: str, source: str, body: str):
         "  direction: 'Bullish' | 'Bearish' | 'Neutral'\n"
         "  impact_score: integer 0-100 (immediate relevance to NASDAQ)\n"
         "  confidence: integer 0-100\n"
-        "  summary: <=25 words with the trade takeaway for NASDAQ\n"
-        "Be strict: generic business items are not relevant."
+        "  summary: <=25 words with the trade takeaway for NASDAQ"
     )
     user = f"Source: {source}\nHeadline: {title}\nContext:\n{ctx}\n{rubric}"
-
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -228,7 +210,6 @@ def ai_classify_nasdaq(title: str, source: str, body: str):
         print("AI error:", e)
         data = {}
 
-    # normalize
     data.setdefault("relevant", False)
     data["direction"] = str(data.get("direction","Neutral")).title()
     try:
@@ -250,24 +231,28 @@ def passes_gate(ai: dict) -> bool:
     if ai.get("confidence", 0) < CONF_MIN:
         return False
     if ai.get("direction") == "Neutral" and not ALLOW_NEUTRAL:
-        # Let neutral through only if very high impact (e.g., Fed minutes ambiguity)
         return ai.get("impact_score", 0) >= (IMPACT_MIN + 10)
     return True
 
 # ----------------- MAIN LOOP -----------------
-
 def fetch_once():
     posts_sent = 0
 
-    # 1) Forex Factory (USD)
-    items = parse_forex_factory_usd()
+    items = []
 
-    # 2) Optional extra feeds from ENV (comma-separated)
-    extra = [u.strip() for u in EXTRA_RSS.split(",") if u.strip()]
-    if extra:
-        items += parse_extra_feeds(extra)
+    # 1) Your curated US-market feeds
+    if FEEDS:
+        items += parse_generic_feeds(FEEDS)
 
-    # Sort newest first when pub available
+    # 2) ForexFactory USD (macro prints), optional
+    if USE_FF:
+        items += parse_forex_factory_usd()
+
+    # 3) Any extra feeds you add later
+    if EXTRA_RSS:
+        items += parse_generic_feeds(EXTRA_RSS)
+
+    # Newest first
     items.sort(key=lambda x: x.get("published") or datetime.now(UTC), reverse=True)
 
     for it in items:
@@ -277,20 +262,20 @@ def fetch_once():
         src = it.get("source") or "Feed"
         pub = it.get("published")
 
-        # freshness
+        # Freshness
         if not is_fresh(pub, MAX_AGE_HOURS):
             continue
 
-        # UID to avoid dups
+        # De-dup
         uid = sha_uid(src, title, link)
         if uid in seen:
             continue
 
-        # NASDAQ heuristic prefilter
+        # Heuristic prefilter
         if not looks_relevant(title, summary):
             continue
 
-        # AI classification (NASDAQ only)
+        # NASDAQ-only AI gate
         ai = ai_classify_nasdaq(title, src, summary)
         if not passes_gate(ai):
             continue
@@ -298,9 +283,9 @@ def fetch_once():
         # Build message
         when_est = utc_to_est(pub)
         sentiment = format_sentiment_for_nasdaq(ai["direction"], ai["confidence"])
-        src_line = f"🔗 <i>Source:</i> {html_escape(src)} —\n{html_escape(link)}" if link else f"🔗 <i>Source:</i> {html_escape(src)}"
+        src_line = f"🔗 <i>Source:</i> {html_escape(src)} —\n{html_escape(link)}" if link \
+                   else f"🔗 <i>Source:</i> {html_escape(src)}"
 
-        # Prefix sentiment BEFORE headline, as requested
         msg = (
             f"{sentiment}\n"
             f"📰 {html_escape(title)}\n"
@@ -320,7 +305,7 @@ def fetch_once():
 
 def main():
     load_seen()
-    send_message("✅ SmartFlow NASDAQ bot started (ForexFactory USD, NASDAQ-only AI).")
+    send_message("✅ SmartFlow NASDAQ bot live — curated US feeds + NASDAQ-only AI.")
     backoff = 5
     while True:
         try:
