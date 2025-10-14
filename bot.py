@@ -1,77 +1,110 @@
 # bot.py
-import os, time, json, hashlib, feedparser, requests, html, re
+# SmartFlow: US Market + ForexFactory Calendar -> Telegram
+# Sentiment is NASDAQ-focused: 🟨 NASDAQ Neutral / 🔺 NASDAQ Bullish / 🔻 NASDAQ Bearish
+
+import os, time, json, hashlib, re, html, feedparser, requests
 from datetime import datetime, timezone, timedelta
-from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
-from openai import OpenAI
+from email.utils import parsedate_to_datetime
+from bs4 import BeautifulSoup
+import xml.etree.ElementTree as ET
 
-# ----------------- ENV -----------------
-TELEGRAM_TOKEN      = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID")
-OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY")
-SLEEP_SECONDS       = int(os.getenv("SLEEP_SECONDS", "60"))
-MAX_AGE_HOURS       = float(os.getenv("MAX_AGE_HOURS", "2"))
-MAX_POSTS_PER_CYCLE = int(os.getenv("MAX_POSTS_PER_CYCLE", "6"))   # 0 = unlimited
+# ====== REQUIRED SECRETS (either hardcode here OR provide via environment) ======
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "PUT_YOUR_TELEGRAM_CHAT_ID_HERE")
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY",   "PUT_YOUR_OPENAI_API_KEY_HERE")  # leave blank "" to disable AI
 
-# Main curated feeds (comma-separated)
-FEEDS = [u.strip() for u in os.getenv("FEEDS", "").split(",") if u.strip()]
+# ====== RUNTIME SETTINGS (kept in code; override by ENV only if you want) ======
+SLEEP_SECONDS       = int(os.getenv("SLEEP_SECONDS", "60"))      # main loop wait
+MAX_AGE_HOURS       = float(os.getenv("MAX_AGE_HOURS", "4"))     # only post fresh items
+MAX_POSTS_PER_CYCLE = int(os.getenv("MAX_POSTS_PER_CYCLE", "25"))
+NEWS_TIMEOUT        = int(os.getenv("NEWS_TIMEOUT", "25"))
 
-# Optional extra feeds (comma-separated) if you want to experiment later
-EXTRA_RSS = [u.strip() for u in os.getenv("EXTRA_RSS", "").split(",") if u.strip()]
+USE_FOREX_FACTORY   = os.getenv("USE_FOREX_FACTORY", "true").lower() != "false"
+FF_URL              = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
+FF_LOOKAHEAD_MIN    = int(os.getenv("FF_LOOKAHEAD_MIN", "5"))    # pre-alert window
+FF_RESULT_WINDOW_MIN= int(os.getenv("FF_RESULT_WINDOW_MIN","15"))# post window
 
-# Keep or disable ForexFactory USD feed (macro prints)
-USE_FF = os.getenv("USE_FF", "true").lower() in ("1","true","yes")
-FF_FEED = "https://www.forexfactory.com/ffcal_week_this.xml"
-
-# NASDAQ-only AI gate
-IMPACT_MIN    = int(os.getenv("IMPACT_MIN", "70"))
-CONF_MIN      = int(os.getenv("CONF_MIN", "60"))
-ALLOW_NEUTRAL = os.getenv("ALLOW_NEUTRAL", "false").lower() in ("1","true","yes")
-
-assert TELEGRAM_TOKEN and TELEGRAM_CHAT_ID and OPENAI_API_KEY, \
-    "Missing env vars: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, OPENAI_API_KEY"
-
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# ----------------- CONSTANTS -----------------
 EST = ZoneInfo("America/New_York")
 UTC = timezone.utc
 
-# NASDAQ movers vocabulary (tight but broad enough)
-HIGH_IMPACT_TERMS = [
-    # Macro / Fed / rates
-    "fed","powell","fomc","rate","rates","hike","cut",
-    "cpi","ppi","pce","nfp","jobs","payrolls","unemployment","ism","pmi","gdp","retail sales",
-    "treasury","yield","10-year","10yr","2-year","dxy","usd",
-    # Big tech / semis / ai
-    "nvidia","nvda","amd","aapl","apple","msft","meta","goog","alphabet",
-    "amazon","amzn","avgo","broadcom","intc","arm","semiconductor","chip","ai","gpu",
-    # Company catalysts
-    "downgrade","upgrade","price target","guidance","outlook",
-    "earnings","eps","revenue","beat","miss","layoff","strike","ceo","resigns","steps down",
-    "buyback","dividend","merger","acquisition","lbo","ftc","doj","sec","antitrust",
-    # Geopolitics / energy shocks
-    "opec","iran","israel","ukraine","houthis","strait","attack","sanction","export control"
+# Store dedupe IDs locally
+SEEN_NEWS_PATH = "seen_news.txt"
+FF_REMIND_PATH = "ff_reminded.txt"
+FF_RESULT_PATH = "ff_released.txt"
+
+# ============ FEEDS: broad US / NASDAQ-relevant firehose ============
+# (some sites may occasionally return 403; code is resilient and continues)
+FEEDS = [
+    # Reuters
+    "https://www.reuters.com/markets/us/rss",
+    "https://www.reuters.com/markets/earnings/rss",
+    "https://www.reuters.com/technology/rss",
+
+    # CNBC
+    "https://www.cnbc.com/id/100003114/device/rss/rss.html",   # Top
+    "https://www.cnbc.com/id/100727362/device/rss/rss.html",   # Tech
+
+    # Yahoo Finance / MarketWatch
+    "https://finance.yahoo.com/news/rssindex",
+    "https://www.marketwatch.com/rss/topstories",
+
+    # AP Business / CNN Business / ABC / CBS / BBC / NYT (business)
+    "https://apnews.com/hub/business?output=rss",
+    "https://rss.cnn.com/rss/money_news_international.rss",
+    "https://abcnews.go.com/abcnews/moneyheadlines",           # HTML page with feed tags; feedparser handles
+    "https://www.cbsnews.com/latest/rss/business",
+    "https://feeds.bbci.co.uk/news/business/rss.xml",
+    "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
+
+    # NASDAQ official
+    "https://www.nasdaq.com/feed/rssoutbound?category=MarketNews",
+    "https://www.nasdaq.com/feed/rssoutbound?category=Earnings",
+
+    # US Gov / Policy (press -> markets)
+    "https://www.whitehouse.gov/briefing-room/feed/",
+    "https://home.treasury.gov/news/press-releases/all/feed",
+    "https://www.federalreserve.gov/feeds/press_all.xml",
+    "https://www.federalreserve.gov/feeds/press_monetary.xml",
+    "https://www.bls.gov/feed/news.rss",
+    "https://www.bea.gov/news/rss.xml",
+    "https://www.sec.gov/news/pressreleases.rss",
+    "https://www.sec.gov/news/speeches.rss",
 ]
 
-SEEN_PATH = "seen.txt"
-seen = set()
+# ---------- Optional OpenAI client ----------
+USE_AI = bool(OPENAI_API_KEY.strip())
+_client = None
+if USE_AI:
+    try:
+        from openai import OpenAI
+        _client = OpenAI(api_key=OPENAI_API_KEY)
+    except Exception as e:
+        print("OpenAI init error:", e)
+        USE_AI = False
 
-# ----------------- UTIL -----------------
-def load_seen():
-    if os.path.exists(SEEN_PATH):
-        with open(SEEN_PATH, "r", encoding="utf-8") as f:
-            for line in f:
-                uid = line.strip()
-                if uid:
-                    seen.add(uid)
+UA = {"User-Agent": "Mozilla/5.0 (compatible; SmartFlowBot/1.0; +https://example.com/bot)"}
 
-def save_seen(uid: str):
-    with open(SEEN_PATH, "a", encoding="utf-8") as f:
-        f.write(uid + "\n")
-
+# ---------- Utilities ----------
 def html_escape(s: str) -> str:
     return html.escape(s or "")
+
+def sha_uid(*parts) -> str:
+    return hashlib.sha1(("||".join(parts)).encode("utf-8")).hexdigest()
+
+def read_ids(path: str) -> set[str]:
+    s = set()
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    s.add(line)
+    return s
+
+def append_id(path: str, id_: str):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(id_ + "\n")
 
 def parse_pub(dt_str: str | None) -> datetime | None:
     if not dt_str:
@@ -89,233 +122,293 @@ def utc_to_est(dt: datetime | None) -> str:
         return ""
     return dt.astimezone(EST).strftime("%-I:%M %p EST · %b %d")
 
-def is_fresh(utc_dt: datetime | None, max_age_hours: float) -> bool:
+def is_fresh(utc_dt: datetime | None, hours: float) -> bool:
     if not utc_dt:
-        return True  # allow if missing; AI will still gate for relevance
-    age = datetime.now(UTC) - utc_dt
-    return age <= timedelta(hours=max_age_hours)
+        # if missing, consider "fresh" to avoid dropping real-time items
+        return True
+    return (datetime.now(UTC) - utc_dt) <= timedelta(hours=hours)
 
-def sha_uid(source: str, title: str, link: str) -> str:
-    base = f"{source}||{title}||{link}"
-    return hashlib.sha1(base.encode("utf-8")).hexdigest()
-
-def send_message(text: str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+def tg_send(text: str):
     try:
-        requests.get(url, params={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        }, timeout=20)
+        requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            params={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=NEWS_TIMEOUT,
+        )
     except Exception as e:
         print("Telegram error:", e)
 
-def format_sentiment_for_nasdaq(direction: str, conf: int) -> str:
-    d = (direction or "Neutral").title()
-    if d == "Bearish":
-        return f"🔻 <b>Bearish for NASDAQ</b>"
-    elif d == "Bullish":
-        return f"🔺 <b>Bullish for NASDAQ</b>"
-    else:
-        return f"🟨 Neutral for NASDAQ"
-
-# ----------------- RSS PARSERS -----------------
-def parse_generic_feeds(urls: list[str]):
-    out = []
-    for url in urls:
-        try:
-            feed = feedparser.parse(url.strip())
-        except Exception as e:
-            print("RSS parse error:", url, e)
-            continue
-        src_title = (getattr(getattr(feed, "feed", None), "title", None) or "Feed").strip()
-        for e in getattr(feed, "entries", []):
-            title = (getattr(e, "title", "") or "").strip()
-            link = (getattr(e, "link", "") or "").strip()
-            summary = (getattr(e, "summary", "") or getattr(e, "description", "") or "").strip()
-            pub = parse_pub(getattr(e, "published", None))
-            out.append({
-                "title": title,
-                "summary": summary,
-                "link": link,
-                "source": src_title,
-                "published": pub
-            })
-    return out
-
-def parse_forex_factory_usd():
-    out = []
+def fetch_article_text(url: str) -> str:
+    """Lightweight article text fetch using BeautifulSoup (best-effort)."""
     try:
-        feed = feedparser.parse(FF_FEED)
-    except Exception as e:
-        print("FF parse error:", e)
-        return out
+        r = requests.get(url, headers=UA, timeout=NEWS_TIMEOUT)
+        if not r.ok:
+            return ""
+        soup = BeautifulSoup(r.content, "html.parser")
+        # prefer article/body text blocks
+        for selector in ["article", "main", "div#content", "div.story", "div.article"]:
+            node = soup.select_one(selector)
+            if node:
+                txt = " ".join(node.get_text(separator=" ").split())
+                return txt[:4000]
+        # fallback: whole-page text (trim)
+        txt = " ".join(soup.get_text(separator=" ").split())
+        return txt[:4000]
+    except Exception:
+        return ""
 
-    for e in getattr(feed, "entries", []):
-        title = (e.get("title") or "").strip()
-        summary = (e.get("summary") or e.get("description") or "").strip()
-        link = (e.get("link") or "").strip()
-        src = "ForexFactory (USD)"
+# ---------- AI: NASDAQ sentiment + 1-line summary ----------
+def classify_and_summarize_for_nasdaq(title: str, source: str, link: str, snippet: str):
+    """
+    Returns (label_text, arrow, summary_text) where:
+      label_text ∈ {"NASDAQ Bullish","NASDAQ Bearish","NASDAQ Neutral"}
+      arrow ∈ {"🔺","🔻","🟨"}
+      summary_text: <= 25 words, trader-focused (may be empty if AI disabled or fails)
+    """
+    if not USE_AI or not _client:
+        return ("NASDAQ Neutral", "🟨", "")
 
-        # USD-only heuristic
-        text = f"{title}\n{summary}".lower()
-        if "usd" not in text:
-            continue
-
-        pub = parse_pub(e.get("published"))
-        out.append({
-            "title": title,
-            "summary": summary,
-            "link": link,
-            "source": src,
-            "published": pub
-        })
-    return out
-
-# ----------------- PREFILTER -----------------
-def looks_relevant(title: str, summary: str) -> bool:
-    txt = f"{title}\n{summary}".lower()
-    return any(k in txt for k in HIGH_IMPACT_TERMS)
-
-# ----------------- AI CLASSIFIER -----------------
-def ai_classify_nasdaq(title: str, source: str, body: str):
-    ctx = (body or "")[:4000]
-    system = (
-        "You are a professional US equities day-trading news analyst for a NASDAQ scalper. "
-        "Only consider effects on the NASDAQ-100 (QQQ/NDX) and US mega-cap tech. "
-        "Focus on near-term (0–48h) market impact. If not impactful for NASDAQ, set relevant=false."
-    )
-    rubric = (
-        "Return pure JSON with keys:\n"
-        "  relevant: boolean (true ONLY if likely to move NASDAQ in the next 0–48h)\n"
-        "  direction: 'Bullish' | 'Bearish' | 'Neutral'\n"
-        "  impact_score: integer 0-100 (immediate relevance to NASDAQ)\n"
-        "  confidence: integer 0-100\n"
-        "  summary: <=25 words with the trade takeaway for NASDAQ"
-    )
-    user = f"Source: {source}\nHeadline: {title}\nContext:\n{ctx}\n{rubric}"
     try:
-        resp = client.chat.completions.create(
+        sys = (
+            "You are a veteran US equities day trader. "
+            "Classify the headline's immediate impact on NASDAQ (US tech-heavy index) "
+            "as Bullish, Bearish, or Neutral, and provide a 1-sentence summary (<=25 words) "
+            "focused on trading impact. Consider: Fed policy, yields, inflation, geopolitics, "
+            "earnings, guidance, chips/AI, regulation, fiscal news, big-cap tech moves."
+            "\nReturn JSON: {\"sentiment\":\"Bullish|Bearish|Neutral\",\"summary\":\"...\"}"
+        )
+        user = f"Source: {source}\nHeadline: {title}\nURL: {link}\nContext:\n{snippet[:1200]}"
+        resp = _client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role":"system","content":system},
-                {"role":"user","content":user}
-            ],
+            messages=[{"role":"system","content":sys},
+                      {"role":"user","content":user}],
             temperature=0.1,
         )
-        raw = resp.choices[0].message.content.strip()
-        data = json.loads(raw) if raw.startswith("{") else {}
+        txt = resp.choices[0].message.content.strip()
+        data = json.loads(txt) if txt.strip().startswith("{") else {}
+        sent = str(data.get("sentiment","Neutral")).strip().title()
+        summ = str(data.get("summary","")).strip()[:300]
     except Exception as e:
-        print("AI error:", e)
-        data = {}
+        print("AI classify error:", e)
+        sent, summ = "Neutral", ""
 
-    data.setdefault("relevant", False)
-    data["direction"] = str(data.get("direction","Neutral")).title()
+    if sent == "Bullish":
+        return ("NASDAQ Bullish", "🔺", summ)
+    if sent == "Bearish":
+        return ("NASDAQ Bearish", "🔻", summ)
+    return ("NASDAQ Neutral", "🟨", summ)
+
+# ---------- RSS parsing ----------
+def parse_feed_with_ua(url: str):
+    """Fetch with UA to reduce 403s, then feedparser on bytes."""
     try:
-        data["impact_score"] = int(data.get("impact_score", 0))
+        r = requests.get(url, headers=UA, timeout=NEWS_TIMEOUT)
+        if r.ok:
+            return feedparser.parse(r.content)
     except Exception:
-        data["impact_score"] = 0
+        pass
+    # fallback
     try:
-        data["confidence"] = int(data.get("confidence", 50))
+        return feedparser.parse(url)
     except Exception:
-        data["confidence"] = 50
-    data["summary"] = (data.get("summary") or title)[:200]
-    return data
+        return None
 
-def passes_gate(ai: dict) -> bool:
-    if not ai.get("relevant"):
-        return False
-    if ai.get("impact_score", 0) < IMPACT_MIN:
-        return False
-    if ai.get("confidence", 0) < CONF_MIN:
-        return False
-    if ai.get("direction") == "Neutral" and not ALLOW_NEUTRAL:
-        return ai.get("impact_score", 0) >= (IMPACT_MIN + 10)
-    return True
-
-# ----------------- MAIN LOOP -----------------
-def fetch_once():
-    posts_sent = 0
-
+def harvest_feeds(feed_urls: list[str]):
     items = []
+    for url in feed_urls:
+        feed = parse_feed_with_ua(url)
+        if not feed:
+            print("Parse error (feed):", url)
+            continue
+        src_title = (getattr(getattr(feed,"feed",None),"title",None) or "Feed").strip()
+        for e in getattr(feed, "entries", []):
+            title = (getattr(e, "title", "") or "").strip()
+            link  = (getattr(e, "link", "") or "").strip()
+            summary = (getattr(e, "summary", "") or getattr(e, "description","") or "").strip()
+            pub = parse_pub(getattr(e, "published", None))
+            items.append({
+                "title": title,
+                "link": link,
+                "source": src_title,
+                "summary": summary,
+                "published": pub
+            })
+    return items
 
-    # 1) Your curated US-market feeds
-    if FEEDS:
-        items += parse_generic_feeds(FEEDS)
+def send_news_batch():
+    seen = read_ids(SEEN_NEWS_PATH)
 
-    # 2) ForexFactory USD (macro prints), optional
-    if USE_FF:
-        items += parse_forex_factory_usd()
-
-    # 3) Any extra feeds you add later
-    if EXTRA_RSS:
-        items += parse_generic_feeds(EXTRA_RSS)
-
-    # Newest first
+    items = harvest_feeds(FEEDS)
     items.sort(key=lambda x: x.get("published") or datetime.now(UTC), reverse=True)
 
+    sent = 0
     for it in items:
-        title = it["title"]
-        summary = it.get("summary") or ""
-        link = it.get("link") or ""
-        src = it.get("source") or "Feed"
-        pub = it.get("published")
-
-        # Freshness
+        title = it["title"]; link = it["link"]; src = it["source"]; pub = it["published"]
+        if not title or not link:
+            continue
         if not is_fresh(pub, MAX_AGE_HOURS):
             continue
 
-        # De-dup
         uid = sha_uid(src, title, link)
         if uid in seen:
             continue
 
-        # Heuristic prefilter
-        if not looks_relevant(title, summary):
-            continue
+        # Pull some article text to help AI
+        body = it["summary"] or fetch_article_text(link)
 
-        # NASDAQ-only AI gate
-        ai = ai_classify_nasdaq(title, src, summary)
-        if not passes_gate(ai):
-            continue
+        label, arrow, summ = classify_and_summarize_for_nasdaq(title, src, link, body)
+        when = utc_to_est(pub)
+        src_line = f"🔗 <i>Source:</i> {html_escape(src)} —\n{html_escape(link)}" if link else f"🔗 <i>Source:</i> {html_escape(src)}"
 
-        # Build message
-        when_est = utc_to_est(pub)
-        sentiment = format_sentiment_for_nasdaq(ai["direction"], ai["confidence"])
-        src_line = f"🔗 <i>Source:</i> {html_escape(src)} —\n{html_escape(link)}" if link \
-                   else f"🔗 <i>Source:</i> {html_escape(src)}"
-
+        # First line sentiment per your spec:
         msg = (
-            f"{sentiment}\n"
-            f"📰 {html_escape(title)}\n"
-            f"✍️ {html_escape(ai['summary'])}\n"
-            f"{src_line}\n"
-            f"🕒 {html_escape(when_est)}"
+            f"{arrow} <b>{label}</b>\n"
+            f"📰 {html_escape(title)}\n" +
+            (f"✍️ {html_escape(summ)}\n" if summ else "") +
+            f"{src_line}\n" +
+            (f"🕒 {html_escape(when)}" if when else "")
         )
 
-        send_message(msg)
-        seen.add(uid)
-        save_seen(uid)
-        posts_sent += 1
-        time.sleep(0.7)
-
-        if MAX_POSTS_PER_CYCLE and posts_sent >= MAX_POSTS_PER_CYCLE:
+        tg_send(msg)
+        append_id(SEEN_NEWS_PATH, uid)
+        sent += 1
+        time.sleep(0.5)
+        if MAX_POSTS_PER_CYCLE and sent >= MAX_POSTS_PER_CYCLE:
             break
 
+# ---------- ForexFactory calendar ----------
+def _try_float(x: str | None):
+    try:
+        if x is None:
+            return None
+        val = re.sub(r"[^\d\.\-]", "", x)
+        if val in {"", ".", "-"}:
+            return None
+        return float(val)
+    except Exception:
+        return None
+
+def parse_ff_calendar():
+    out = []
+    try:
+        r = requests.get(FF_URL, headers=UA, timeout=NEWS_TIMEOUT)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+    except Exception as e:
+        print("FF fetch error:", e)
+        return out
+
+    for ev in root.findall(".//event"):
+        country = (ev.findtext("country") or "").strip()
+        impact  = (ev.findtext("impact")  or "").strip().lower()
+        if country != "USD" or "high" not in impact:
+            continue
+
+        title     = (ev.findtext("title") or "").strip()
+        date_str  = (ev.findtext("date")  or "").strip()
+        time_str  = (ev.findtext("time")  or "").strip()
+        tz_str    = (ev.findtext("timezone") or "UTC").strip()
+        forecast  = (ev.findtext("forecast") or "").strip()
+        previous  = (ev.findtext("previous") or "").strip()
+        actual    = (ev.findtext("actual") or "").strip()
+        ev_id     = (ev.findtext("id") or sha_uid(title, date_str, time_str))
+
+        if not time_str or time_str.lower().startswith("all"):
+            # no specific time = skip real-time alerts
+            continue
+
+        try:
+            dt_local = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+            if "est" in tz_str.lower() or "edt" in tz_str.lower() or "new york" in tz_str.lower():
+                dt_utc = dt_local.replace(tzinfo=EST).astimezone(UTC)
+            else:
+                dt_utc = dt_local.replace(tzinfo=UTC)
+        except Exception:
+            continue
+
+        out.append({
+            "id": ev_id,
+            "title": title,
+            "dt_utc": dt_utc,
+            "forecast": forecast,
+            "previous": previous,
+            "actual": actual,
+        })
+    return out
+
+def infer_direction_for_nasdaq(title: str, actual: str, forecast: str) -> str:
+    a = _try_float(actual); f = _try_float(forecast)
+    if a is None or f is None:
+        return "Neutral"
+    t = title.lower()
+    # simple heuristics
+    if any(k in t for k in ["cpi","pce","ppi","inflation"]):
+        return "Bearish" if a > f else ("Bullish" if a < f else "Neutral")
+    if "unemployment" in t:
+        return "Bearish" if a > f else ("Bullish" if a < f else "Neutral")
+    if any(k in t for k in ["nonfarm","payroll"]):
+        return "Bullish" if a > f else ("Bearish" if a < f else "Neutral")
+    if "retail sales" in t:
+        return "Bullish" if a > f else ("Bearish" if a < f else "Neutral")
+    if any(k in t for k in ["ism","pmi"]):
+        return "Bullish" if a > f else ("Bearish" if a < f else "Neutral")
+    return "Neutral"
+
+def send_ff_alerts_and_results():
+    if not USE_FOREX_FACTORY:
+        return
+    reminded = read_ids(FF_REMIND_PATH)
+    released = read_ids(FF_RESULT_PATH)
+    now = datetime.now(UTC)
+
+    for ev in parse_ff_calendar():
+        ev_id = ev["id"]; title = ev["title"]; dt_utc = ev["dt_utc"]
+        fcast = ev["forecast"]; prev = ev["previous"]; actual = ev["actual"]
+
+        # Pre-alert 0..FF_LOOKAHEAD_MIN minutes before
+        mins_to = (dt_utc - now).total_seconds()/60.0
+        if 0 <= mins_to <= FF_LOOKAHEAD_MIN and ev_id not in reminded:
+            msg = (
+                f"⏳ <b>{html_escape(title)}</b> in ~{int(mins_to)} min\n"
+                f"Forecast: {html_escape(fcast or '—')} | Previous: {html_escape(prev or '—')}\n"
+                f"🕒 {html_escape(utc_to_est(dt_utc))}"
+            )
+            tg_send(msg)
+            append_id(FF_REMIND_PATH, ev_id)
+
+        # Result 0..FF_RESULT_WINDOW_MIN minutes after (requires 'actual')
+        mins_since = (now - dt_utc).total_seconds()/60.0
+        if 0 <= mins_since <= FF_RESULT_WINDOW_MIN and ev_id not in released and actual and actual.strip():
+            direction = infer_direction_for_nasdaq(title, actual, fcast)
+            arrow = "🔺" if direction == "Bullish" else ("🔻" if direction == "Bearish" else "🟨")
+            msg = (
+                f"📊 <b>{html_escape(title)}</b>\n"
+                f"Actual: {html_escape(actual)} | Forecast: {html_escape(fcast or '—')} | Previous: {html_escape(prev or '—')}\n"
+                f"{arrow} NASDAQ {direction}\n"
+                f"🕒 {html_escape(utc_to_est(dt_utc))}"
+            )
+            tg_send(msg)
+            append_id(FF_RESULT_PATH, ev_id)
+
+# ---------- Main ----------
 def main():
-    load_seen()
-    send_message("✅ SmartFlow NASDAQ bot live — curated US feeds + NASDAQ-only AI.")
+    tg_send("✅ SmartFlow NASDAQ bot live — curated US feeds + ForexFactory calendar. AI on.")
     backoff = 5
     while True:
         try:
-            fetch_once()
+            send_news_batch()
+            send_ff_alerts_and_results()
             time.sleep(SLEEP_SECONDS)
             backoff = 5
         except Exception as e:
             print("Loop error:", e)
             time.sleep(backoff)
-            backoff = min(backoff * 2, 240)
+            backoff = min(backoff * 2, 180)
 
 if __name__ == "__main__":
     main()
