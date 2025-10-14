@@ -2,8 +2,11 @@ services:
   - type: worker
     name: smartflow-news
     env: python
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python bot.py"
+    plan: starter
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    autoDeploy: true
     envVars:
       - key: TELEGRAM_TOKEN
         sync: false
@@ -11,7 +14,16 @@ services:
         sync: false
       - key: OPENAI_API_KEY
         sync: false
+      # Optional (you can omit these to use defaults from code)
       - key: SLEEP_SECONDS
         value: "60"
-      - key: FEEDS
-        value: "https://feeds.a.dj.com/rss/RSSMarketsMain.xml,https://www.cnbc.com/id/100003114/device/rss/rss.html,https://www.reuters.com/rssFeed/businessNews"
+      - key: MAX_AGE_HOURS
+        value: "4"
+      - key: MAX_POSTS_PER_CYCLE
+        value: "25"
+      - key: USE_FOREX_FACTORY
+        value: "true"
+      - key: FF_LOOKAHEAD_MIN
+        value: "5"
+      - key: FF_RESULT_WINDOW_MIN
+        value: "15"
