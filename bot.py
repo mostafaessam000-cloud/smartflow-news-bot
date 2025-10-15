@@ -179,12 +179,15 @@ def format_sentiment(ai: dict) -> str:
         conf = int(float(ai.get("confidence", 60)))
     except Exception:
         conf = 60
+
     if s == "Neutral":
         return "🟨 NASDAQ Neutral"
     elif s == "Bearish":
         return f"🔻 <b>NASDAQ Bearish</b> ({conf}%)"
     else:
-        return f"🔺 <b>NASDAQ Bullish</b> ({conf}%)"
+        # Green up arrow for bullish
+        return f"🟢 <b>NASDAQ Bullish</b> ({conf}%)"
+
 
 # ---------- Article extraction ----------
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"}
