@@ -404,6 +404,21 @@ def parse_feed_with_ua(url: str):
 # =========================
 # Fetch & process
 # =========================
+RANK_BY_IMPACT = os.getenv("RANK_BY_IMPACT", "true").lower() in ("1","true","yes")
+IMPACT_WEIGHT  = float(os.getenv("IMPACT_WEIGHT", "0.7"))
+RECENCY_WEIGHT = float(os.getenv("RECENCY_WEIGHT", "0.3"))
+
+def recency_score(minutes_old: int) -> float:
+    """
+    Map age in minutes to a 0..100 score (newer = higher).
+    0 min -> ~100, 60 min -> ~70, 120 min -> ~50, 180+ -> lower.
+    """
+    if minutes_old <= 0:
+        return 100.0
+    # exponential decay tuned for news
+    import math
+    return max(0.0, 100.0 * math.exp(-minutes_old / 120.0))  # 2h half-life-ish
+
 def fetch_once(limit_per_feed=10):
     global seen
 
@@ -429,7 +444,8 @@ def fetch_once(limit_per_feed=10):
     enriched.sort(key=lambda x: x[0] or datetime.now(timezone.utc), reverse=True)
 
     # 3) Iterate and post
-    posted = 0
+    # 3) Score candidates first (AI + ranking), then post top N
+    candidates = []
     seen_now = set()
     now_utc = datetime.now(timezone.utc)
 
@@ -440,17 +456,16 @@ def fetch_once(limit_per_feed=10):
         if not looks_relevant(it["title"]):
             continue
 
+        # Extract article text; if empty, we'll classify from headline only
         article_text, published_from_html = extract_article_text(it["link"])
-
         if not article_text:
             rss_summary = getattr(it["entry"], "summary", "") or getattr(it["entry"], "description", "")
             if rss_summary:
-                rss_summary = BeautifulSoup(rss_summary, "html.parser").get_text(" ", strip=True)
-                article_text = rss_summary
+                article_text = BeautifulSoup(rss_summary, "html.parser").get_text(" ", strip=True)
 
         dt_utc = published_dt_from_entry(it["entry"], published_from_html) or dt_rss or now_utc
 
-        # Freshness
+        # Freshness filter
         if dt_utc and (now_utc - dt_utc) > timedelta(hours=MAX_AGE_HOURS):
             continue
 
@@ -461,13 +476,43 @@ def fetch_once(limit_per_feed=10):
         if ai["confidence"] < MIN_CONFIDENCE:
             continue
 
+        minutes_ago = int((now_utc - dt_utc).total_seconds() // 60)
+        rscore = recency_score(minutes_ago)
+        # Combine impact (from AI) and recency
+        if RANK_BY_IMPACT:
+            final_score = IMPACT_WEIGHT * float(ai.get("impact", ai.get("confidence", 60))) + \
+                          RECENCY_WEIGHT * rscore
+        else:
+            final_score = float(ai.get("confidence", 60))
+
+        candidates.append({
+            "score": final_score,
+            "uid": uid,
+            "it": it,
+            "ai": ai,
+            "dt_utc": dt_utc,
+            "minutes_ago": minutes_ago,
+        })
+
+    # Sort by score (desc), then newest
+    candidates.sort(key=lambda x: (x["score"], x["dt_utc"]), reverse=True)
+
+    # Apply MAX_POSTS_PER_CYCLE limit HERE (top-N most impactful)
+    limit = MAX_POSTS_PER_CYCLE if MAX_POSTS_PER_CYCLE > 0 else len(candidates)
+    winners = candidates[:limit]
+
+    posted = 0
+    for c in winners:
+        it = c["it"]
+        ai = c["ai"]
+        dt_utc = c["dt_utc"]
+
         # Time formatting
         dt_est = dt_utc.astimezone(EST)
-        minutes_ago = int((now_utc - dt_utc).total_seconds() // 60)
+        minutes_ago = c["minutes_ago"]
         ago_str = f"{minutes_ago} min ago" if minutes_ago < 90 else f"{minutes_ago//60} hr ago"
         when = f"{dt_est.strftime('%-I:%M %p ')}{_tz_label} • {dt_est.strftime('%b %-d')} ({ago_str})"
 
-        # Friendly publisher
         nice_src = publisher_from_link(it["link"], it["source"])
         if it["link"]:
             src_line = f'🔗 Source: <a href="{html_escape(it["link"])}">{html_escape(nice_src)}</a>'
@@ -476,9 +521,7 @@ def fetch_once(limit_per_feed=10):
 
         summary = (ai.get("summary") or "").strip()
         if not summary:
-            summary = "Headline-driven; watch for confirmation in futures and mega-cap tech."
-        if summary.lower() == it["title"].strip().lower():
-            summary = "Market takeaway: headline implies near-term volatility; watch QQQ/NQ leaders."
+            summary = f"Headline suggests near-term move; watch mega-cap tech — {it['title'][:120]}"
 
         msg = (
             f"{format_sentiment(ai)}\n"
@@ -489,12 +532,14 @@ def fetch_once(limit_per_feed=10):
         )
 
         send_message(msg)
-        seen_now.add(uid)
+        seen_now.add(c["uid"])
         posted += 1
         time.sleep(1)
 
-        if MAX_POSTS_PER_CYCLE > 0 and posted >= MAX_POSTS_PER_CYCLE:
-            break
+    if seen_now:
+        seen |= seen_now
+        save_seen(seen)
+
 
     if seen_now:
         seen |= seen_now
