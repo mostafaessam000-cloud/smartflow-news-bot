@@ -1,4 +1,6 @@
 # bot.py (stable UA + fresh Reuters feeds + TZ fallback)
+# AI: Google Gemini
+import google.generativeai as genai
 import os, re, time, json, hashlib, feedparser, requests
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
@@ -19,6 +21,8 @@ except Exception:
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
 SLEEP_SECONDS    = int(os.getenv("SLEEP_SECONDS", "60"))   # poll interval
 MAX_AGE_HOURS    = int(os.getenv("MAX_AGE_HOURS", "2"))    # fresh-only window
@@ -72,17 +76,13 @@ HIGH_IMPACT_TERMS = [k.strip().lower() for k in KEYWORDS_ENV.split(",") if k.str
     "semiconductor","chip","ai","regulation","export control","rare earth"
 ]
 
-# Optional OpenAI; your old file required it, but we’ll make it optional:
-USE_AI = bool((OPENAI_API_KEY or "").strip())
-client = None
+# Optional Gemini
+USE_AI = bool(GEMINI_API_KEY)
 if USE_AI:
     try:
-        from openai import OpenAI
-        import httpx
-        client = OpenAI(api_key=OPENAI_API_KEY,
-                        http_client=httpx.Client(follow_redirects=True, timeout=20))
+        genai.configure(api_key=GEMINI_API_KEY)
     except Exception as e:
-        print("OpenAI init error:", e)
+        print("Gemini init error:", e)
         USE_AI = False
 
 # =========================
@@ -282,47 +282,69 @@ def published_dt_from_entry(entry, link_html_published=None) -> datetime | None:
 
 # ---------- AI classification ----------
 def ai_classify(title: str, source: str, article_text: str):
+    """
+    Returns dict: {"summary": str, "sentiment": "Bullish|Bearish|Neutral", "confidence": int}
+    Uses Google Gemini; falls back to Neutral if API fails.
+    """
     if not USE_AI:
-        return {"summary": "", "sentiment":"Neutral","confidence":60,"tags":[]}
+        return {"summary": "", "sentiment": "Neutral", "confidence": 60, "tags": []}
 
-    ctx = article_text[:4000] if article_text else ""
+    # Keep it short; we already do headline + some context
+    ctx = (article_text or "")[:4000]
     system = (
         "You are a senior macro/market analyst advising a NASDAQ day trader. "
         "Read the article context (if any) and the headline. "
-        "Deliver a crisp <=25-word market takeaway that does NOT repeat the headline verbatim. "
-        "When evidence suggests direction, prefer a decisive classification (Bullish or Bearish). "
-        "Choose Neutral ONLY if there is truly no directional signal in the next 1–3 sessions. "
-        "Classify overall impact on NASDAQ as Bullish, Bearish, or Neutral. "
-        "Provide a confidence 0–100. Return JSON ONLY with keys: summary, sentiment, confidence."
+        "Return JSON ONLY with keys: summary, sentiment, confidence. "
+        "summary: ≤25 words; do NOT repeat the headline. "
+        "sentiment: one of Bullish, Bearish, Neutral for the next 1–3 NASDAQ sessions. "
+        "Pick Bullish/Bearish when there is any reasonable directional signal; "
+        "use Neutral only if truly no signal. "
+        "confidence: integer 0–100."
     )
     user = f"Source: {source}\nHeadline: {title}\nArticle context:\n{ctx}\nReturn JSON only."
 
     try:
-        from openai import OpenAI
-        import httpx
-        client = OpenAI(api_key=OPENAI_API_KEY,
-                        http_client=httpx.Client(follow_redirects=True, timeout=20))
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role":"system","content":system},
-                      {"role":"user","content":user}],
-            temperature=0.2,
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        res = model.generate_content(
+            [{"text": system}, {"text": user}],
+            generation_config={"temperature": 0.2, "max_output_tokens": 200},
+            safety_settings={  # be permissive (market text can look “harmful” otherwise)
+                "HARASSMENT": "block_none",
+                "HATE_SPEECH": "block_none",
+                "SEXUAL_CONTENT": "block_none",
+                "DANGEROUS_CONTENT": "block_none",
+            },
         )
-        text = resp.choices[0].message.content.strip()
-        data = json.loads(text) if text.startswith("{") else {
-            "summary": text[:200],
-            "sentiment": "Neutral",
-            "confidence": 60,
-        }
-        data["sentiment"]  = str(data.get("sentiment","Neutral")).title()
+        out = (res.text or "").strip()
+        # tolerant JSON extraction
         try:
-            data["confidence"] = int(float(data.get("confidence", 60)))
+            blob = out[out.find("{"): out.rfind("}")+1]
+            data = json.loads(blob)
         except Exception:
-            data["confidence"] = 60
-        return data
+            # fallback if model returns plain text
+            data = {"summary": out[:200], "sentiment": "Neutral", "confidence": 60}
+
+        sentiment = str(data.get("sentiment", "Neutral")).title()
+        try:
+            confidence = int(float(data.get("confidence", 60)))
+        except Exception:
+            confidence = 60
+        summary = (data.get("summary") or "").strip()[:220]
+
+        # normalize sentiment strictly
+        s = sentiment.lower()
+        if "bull" in s:
+            sentiment = "Bullish"
+        elif "bear" in s:
+            sentiment = "Bearish"
+        else:
+            sentiment = "Neutral"
+
+        return {"summary": summary, "sentiment": sentiment, "confidence": confidence}
     except Exception as e:
-        print("AI error:", e)
-        return {"summary": "", "sentiment":"Neutral","confidence":60}
+        print("AI error (Gemini):", e)
+        return {"summary": "", "sentiment": "Neutral", "confidence": 60}
+
 
 # =========================
 # Feed fetching with UA
