@@ -186,7 +186,8 @@ def format_sentiment(ai: dict) -> str:
         return f"🔻 <b>NASDAQ Bearish</b> ({conf}%)"
     else:
         # Green up arrow for bullish
-        return f"🟢 <b>NASDAQ Bullish</b> ({conf}%)"
+       return f"<b><font color='green'>▲ NASDAQ Bullish</font></b> ({conf}%)"
+
 
 
 # ---------- Article extraction ----------
