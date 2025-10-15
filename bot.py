@@ -287,113 +287,100 @@ def published_dt_from_entry(entry, link_html_published=None) -> datetime | None:
 # ---------- AI classification ----------
 def ai_classify(title: str, source: str, article_text: str):
     """
-    Returns: {"summary": str, "sentiment": "Bullish|Bearish|Neutral", "confidence": int}
-    Gemini-first; lightly biases away from 'Neutral' unless clearly no directional info.
+    Returns:
+      {
+        "summary": str,                  # <=25 words
+        "sentiment": "Bullish|Bearish|Neutral",
+        "confidence": int,              # model certainty 0-100
+        "impact": int                   # market-moving impact 0-100 (how much it can move NASDAQ in 1–3 sessions)
+      }
+    Works with headline only (article_text may be empty).
     """
     if not USE_AI:
-        return {"summary": "", "sentiment": "Neutral", "confidence": 60}
+        return {"summary": "", "sentiment": "Neutral", "confidence": 60, "impact": 50}
 
-    ctx = (article_text or "")[:4000]
     headline = (title or "").strip()
-
-    FEW_SHOTS = [
-        # bullish
-        {
-            "title": "Nvidia tops estimates, raises full-year revenue outlook",
-            "ctx":  "Chip demand strong; data center revenue accelerates; guidance raised",
-            "sent": "Bullish", "sum": "Guidance raise and beat point to near-term strength in mega-cap tech.", "conf": 80
-        },
-        # bearish
-        {
-            "title": "Apple faces EU antitrust fine over App Store rules",
-            "ctx":  "Regulators preparing penalties; potential changes to business model",
-            "sent": "Bearish", "sum": "Regulatory risk elevates; headline pressure likely for mega-caps.", "conf": 70
-        },
-        # neutral
-        {
-            "title": "U.S. House passes bipartisan budget deal, averts shutdown",
-            "ctx":  "Avoids disruption; no new stimulus or austerity",
-            "sent": "Neutral", "sum": "Removes a tail risk but lacks clear earnings or rate impact.", "conf": 60
-        },
-    ]
+    # Always give the model SOMETHING: headline is enough; add context if available
+    ctx = (article_text or "").strip()
+    ctx_block = f"Context:\n{ctx[:3500]}" if ctx else "Context: (none — classify using headline alone)"
 
     system = (
         "Act as a senior macro/market analyst for a NASDAQ day trader. "
-        "Classify the **next 1–3 sessions** impact on NASDAQ as exactly one of: Bullish, Bearish, Neutral. "
-        "Prefer Bullish/Bearish when any reasonable directional signal exists (beats/misses, guidance changes, rate path shifts, regulation). "
-        "Use Neutral only if there is truly no likely directional effect. "
-        "Return STRICT JSON: {\"summary\": \"<=25 words\", \"sentiment\": \"Bullish|Bearish|Neutral\", \"confidence\": 0-100}."
+        "Using the headline (and context if any), classify the next 1–3 sessions effect on NASDAQ.\n"
+        "Return STRICT JSON ONLY with keys:\n"
+        '{"summary":"<=25 words, specific, not repeating the headline",'
+        '"sentiment":"Bullish|Bearish|Neutral",'
+        '"confidence":0-100,'
+        '"impact":0-100}\n'
+        "- 'impact' = how market-moving this is for NASDAQ (0 = trivial, 100 = very market-moving).\n"
+        "Prefer Bullish/Bearish when any directional cue exists (beats/misses, guidance, rates, regulation, war, tariffs, chip export controls, etc.); "
+        "use Neutral only if truly no likely direction."
     )
 
-    # build few-shot block
-    shot_txt = []
-    for s in FEW_SHOTS:
-        shot_txt.append(
-            f"Example\nTitle: {s['title']}\nContext: {s['ctx']}\n"
-            f"JSON: {{\"summary\":\"{s['sum']}\",\"sentiment\":\"{s['sent']}\",\"confidence\":{s['conf']}}}"
-        )
-    shots = "\n\n".join(shot_txt)
-
-    user = (
-        f"{shots}\n\n"
-        f"Now classify this.\n"
-        f"Title: {headline}\n"
-        f"Context: {ctx}\n"
-        f"JSON only."
-    )
+    user = f"Source: {source}\nHeadline: {headline}\n{ctx_block}\nJSON only."
 
     try:
         model = genai.GenerativeModel(GEMINI_MODEL)
         res = model.generate_content(
             [{"text": system}, {"text": user}],
-            generation_config={"temperature": 0.15, "max_output_tokens": 200},
+            generation_config={
+                "temperature": 0.15,
+                "max_output_tokens": 256,
+                "response_mime_type": "application/json",  # force JSON
+            },
             safety_settings={
-                "HARASSMENT": "block_none", "HATE_SPEECH": "block_none",
-                "SEXUAL_CONTENT": "block_none", "DANGEROUS_CONTENT": "block_none",
+                "HARASSMENT": "block_none",
+                "HATE_SPEECH": "block_none",
+                "SEXUAL_CONTENT": "block_none",
+                "DANGEROUS_CONTENT": "block_none",
             },
         )
-        out = (res.text or "").strip()
-        blob = out[out.find("{"): out.rfind("}")+1]
-        data = json.loads(blob) if blob.startswith("{") and blob.endswith("}") else {}
+        raw = (res.text or "").strip()
+        data = {}
+        try:
+            data = json.loads(raw)
+        except Exception:
+            start, end = raw.find("{"), raw.rfind("}")
+            if start != -1 and end != -1:
+                data = json.loads(raw[start:end+1])
+
+        # normalize keys (case-insensitive)
+        norm = {str(k).lower(): v for k, v in (data or {}).items()}
+        summary = (norm.get("summary") or "").strip()
+        sentiment = str(norm.get("sentiment", "Neutral")).title()
+        try:
+            confidence = int(float(norm.get("confidence", 60)))
+        except Exception:
+            confidence = 60
+        try:
+            impact = int(float(norm.get("impact", confidence)))
+        except Exception:
+            impact = confidence
+
+        # strict normalize
+        s = sentiment.lower()
+        if "bull" in s:
+            sentiment = "Bullish"
+        elif "bear" in s:
+            sentiment = "Bearish"
+        else:
+            sentiment = "Neutral"
+
+        if not summary or summary.lower() in {"bullish", "bearish", "neutral", headline.lower()}:
+            # Make a short, useful line even with just the headline
+            summary = f"Headline suggests near-term move; watch mega-cap tech — {headline[:120]}"
+
+        return {"summary": summary[:220], "sentiment": sentiment, "confidence": confidence, "impact": impact}
     except Exception as e:
         print("AI error (Gemini):", e)
-        data = {}
+        # safe fallback still analyzes headline notionally
+        return {
+            "summary": f"Headline suggests near-term move; watch mega-cap tech — {title[:120]}",
+            "sentiment": "Neutral",
+            "confidence": 60,
+            "impact": 50,
+        }
 
-    summary = (data.get("summary") or "").strip()[:220]
-    sentiment = str(data.get("sentiment", "Neutral")).title()
-    try:
-        confidence = int(float(data.get("confidence", 60)))
-    except Exception:
-        confidence = 60
-
-    # ---------- post-process neutrals (gentle nudge) ----------
-    if sentiment == "Neutral":
-        text_l = f"{headline}. {ctx}".lower()
-
-        bullish_kw = [
-            "beat", "beats", "tops estimates", "raises guidance", "raise guidance",
-            "upgrade", "upgrades", "surge", "rallies", "cuts rates", "stimulus",
-            "expands", "record high", "strong demand", "contracts awarded"
-        ]
-        bearish_kw = [
-            "miss", "misses", "below estimates", "cuts guidance", "lower outlook",
-            "downgrade", "downgrades", "probe", "investigation", "antitrust",
-            "sanction", "tariff", "ban", "recall", "layoff", "strike", "war",
-            "hike rates", "hot inflation", "yields jump", "shutdown"
-        ]
-
-        bull_hit = any(k in text_l for k in bullish_kw)
-        bear_hit = any(k in text_l for k in bearish_kw)
-
-        if bull_hit and not bear_hit:
-            sentiment, confidence = "Bullish", max(confidence, 65)
-        elif bear_hit and not bull_hit:
-            sentiment, confidence = "Bearish", max(confidence, 65)
-
-    if not summary:
-        summary = "Headline-driven setup; watch QQQ/NQ leaders for confirmation."
-
-    return {"summary": summary, "sentiment": sentiment, "confidence": confidence}
 
 # =========================
 # Feed fetching with UA
