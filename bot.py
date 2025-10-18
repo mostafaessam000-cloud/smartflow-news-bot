@@ -1,10 +1,11 @@
-# bot.py — Gemini simplified (headline-first, max 5 posts per cycle)
+# bot.py — Gemini NASDAQ news bot (headline-first, 5 newest per cycle)
 import os, re, time, json, hashlib, feedparser, requests
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
+from email.utils import parsedate_to_datetime
 
-# timezone fallback
+# ===== timezone (safe fallback) =====
 try:
     from zoneinfo import ZoneInfo
     EST = ZoneInfo("America/New_York")
@@ -13,27 +14,23 @@ except Exception:
     EST = timezone.utc
     _tz_label = "UTC"
 
-# ==== env ====
+# =========================
+# Env & Settings
+# =========================
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-SLEEP_SECONDS    = int(os.getenv("SLEEP_SECONDS", "120"))
+SLEEP_SECONDS    = int(os.getenv("SLEEP_SECONDS", "120"))   # poll interval
 MAX_POSTS_PER_CYCLE = int(os.getenv("MAX_POSTS_PER_CYCLE", "5"))
 MAX_AGE_HOURS    = int(os.getenv("MAX_AGE_HOURS", "3"))
+MIN_CONFIDENCE   = int(os.getenv("MIN_CONFIDENCE", "0"))    # e.g., 65
+HIDE_NEUTRAL     = os.getenv("HIDE_NEUTRAL", "false").lower() in ("1","true","yes")
+
 GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL     = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
-# ==== gemini ====
-import google.generativeai as genai
-genai.configure(api_key=GEMINI_API_KEY)
-
-GEMINI_SAFETY = [
-    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_SEXUAL_CONTENT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-]
-
-# ==== feeds (CNN removed) ====
+# =========================
+# Feeds (CNN removed to avoid SSL EOFs)
+# =========================
 DEFAULT_FEEDS = [
     "https://www.reuters.com/markets/us/rss",
     "https://www.reuters.com/markets/earnings/rss",
@@ -48,118 +45,299 @@ DEFAULT_FEEDS = [
     "https://www.theguardian.com/us/business/rss",
 ]
 
-# ==== storage ====
+FEEDS = [u.strip() for u in os.getenv("FEEDS", ",".join(DEFAULT_FEEDS)).split(",") if u.strip()]
+
+# =========================
+# Gemini (AI)
+# =========================
+import google.generativeai as genai
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+# version-agnostic safety config (prevents “sexual_content” false blocks)
+GEMINI_SAFETY_A = [
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_SEXUAL_CONTENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+]
+
+# =========================
+# Dedup storage
+# =========================
 SEEN_PATH = "seen.json"
+SEEN_LIMIT = 6000
+
 def load_seen():
     try:
         if os.path.exists(SEEN_PATH):
-            return set(json.load(open(SEEN_PATH)))
-    except Exception: pass
+            data = json.load(open(SEEN_PATH, "r", encoding="utf-8"))
+            return set(data if isinstance(data, list) else [])
+    except Exception:
+        pass
     return set()
-def save_seen(s):
-    json.dump(list(s), open(SEEN_PATH,"w"))
+
+def save_seen(s: set):
+    if len(s) > SEEN_LIMIT:
+        s = set(list(s)[-SEEN_LIMIT:])
+    json.dump(list(s), open(SEEN_PATH, "w", encoding="utf-8"))
+
 seen = load_seen()
 
-# ==== helpers ====
-def html_escape(s): return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-def normalize_title(t):
-    t=re.sub(r"[^\w\s]"," ",t.lower().strip());return re.sub(r"\s+"," ",t)
-def make_uid(t): return hashlib.sha1(normalize_title(t).encode()).hexdigest()
+# =========================
+# Helpers
+# =========================
+_norm_re = re.compile(r"[^\w\s]")
 
-def send_message(text):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
+def normalize_title(t: str) -> str:
+    t = (t or "").strip().lower()
+    t = _norm_re.sub(" ", t)
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+def make_uid(title: str) -> str:
+    return hashlib.sha1(normalize_title(title).encode("utf-8")).hexdigest()
+
+def html_escape(s: str) -> str:
+    return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+def send_message(text: str):
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID): return
     try:
-        requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            params={"chat_id": TELEGRAM_CHAT_ID,"text":text,"parse_mode":"HTML","disable_web_page_preview":True},timeout=15)
-    except Exception as e: print("telegram:",e)
-
-def extract_article_text(url):
-    try:
-        r=requests.get(url,timeout=10,headers={"User-Agent":"Mozilla/5.0"})
-        full=BeautifulSoup(r.text,"html.parser")
-        ps=[p.get_text(" ",strip=True) for p in full.find_all("p")]
-        txt=" ".join([p for p in ps if len(p)>60])[:5000]
-        return txt, None
-    except: return "", None
-
-def format_sentiment(ai):
-    s=ai.get("sentiment","Neutral").title()
-    c=ai.get("confidence",60)
-    if s=="Bullish": return f"🟢⬆️ <b>NASDAQ Bullish</b> ({c}%)"
-    if s=="Bearish": return f"🔴⬇️ <b>NASDAQ Bearish</b> ({c}%)"
-    return f"🟨 NASDAQ Neutral ({c}%)"
-
-def _trim_words(s, n=20): return " ".join((s or "").split()[:n])
-
-# ==== AI ====
-def ai_classify(title, source, article_text):
-    if not GEMINI_API_KEY: 
-        return {"summary":"","sentiment":"Neutral","confidence":60}
-    headline=title.strip()
-    ctx=article_text.strip() if article_text else ""
-    system=("Classify NASDAQ impact from headline (and context if any). "
-            "Return JSON with keys: summary(<=20 words, may be empty), "
-            "sentiment(Bullish|Bearish|Neutral), confidence(0-100).")
-    user=f"Headline: {headline}\nContext: {ctx[:2000]}\nJSON only."
-    try:
-        model=genai.GenerativeModel(GEMINI_MODEL)
-        res=model.generate_content(
-            [{"text":system},{"text":user}],
-            generation_config={"temperature":0.1,"max_output_tokens":256,"response_mime_type":"application/json"},
-            safety_settings=GEMINI_SAFETY)
-        raw=(res.text or "").strip()
-        data=json.loads(raw[raw.find("{"):raw.rfind("}")+1])
-        s=_trim_words((data.get("summary") or "").strip(),20)
-        sent=str(data.get("sentiment","Neutral")).title()
-        try:c=int(float(data.get("confidence",60)))
-        except:c=60
-        if s.lower() in {"bullish","bearish","neutral",headline.lower()}: s=""
-        return {"summary":s,"sentiment":sent,"confidence":c}
+        requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            params={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=15,
+        )
     except Exception as e:
-        print("ai error:",e)
-        return {"summary":"","sentiment":"Neutral","confidence":60}
+        print("telegram:", e)
 
-# ==== feed parse ====
-def parse_feed(url):
+def publisher_from_link(link: str, fallback: str) -> str:
     try:
-        r=requests.get(url,headers={"User-Agent":"Mozilla/5.0"},timeout=15)
-        if r.ok and r.content: return feedparser.parse(r.content)
-    except Exception as e: print("feed error:",url,e)
+        host = urlparse(link).netloc.lower()
+        parts = host.split(".")
+        dom = ".".join(parts[-2:]) if len(parts) >= 2 else host
+        LABELS = {
+            "reuters.com": "Reuters", "cnbc.com": "CNBC", "marketwatch.com": "MarketWatch",
+            "nasdaq.com": "Nasdaq", "finance.yahoo.com": "Yahoo Finance", "yahoo.com": "Yahoo Finance",
+            "apnews.com": "AP News", "theguardian.com": "The Guardian", "cbsnews.com": "CBS News / MoneyWatch",
+            "abcnews.go.com": "ABC News", "bbc.com": "BBC", "bbc.co.uk": "BBC",
+        }
+        return LABELS.get(dom, fallback)
+    except Exception:
+        return fallback
+
+def format_sentiment(ai: dict) -> str:
+    s = (ai.get("sentiment") or "Neutral").title()
+    try: conf = int(float(ai.get("confidence", 60)))
+    except: conf = 60
+    if s == "Bullish": return f"🟢⬆️ <b>NASDAQ Bullish</b> ({conf}%)"
+    if s == "Bearish": return f"🔴⬇️ <b>NASDAQ Bearish</b> ({conf}%)"
+    return f"🟨 NASDAQ Neutral ({conf}%)"
+
+def _trim_words(s: str, n: int = 20) -> str:
+    return " ".join((s or "").strip().split()[:n])
+
+# published time helpers (to get “15 min ago”)
+def published_dt_from_entry(entry) -> datetime | None:
+    for attr in ("published_parsed","updated_parsed"):
+        t = getattr(entry, attr, None)
+        if t:
+            try: return datetime(*t[:6], tzinfo=timezone.utc)
+            except Exception: pass
+    for attr in ("published","updated","created"):
+        s = getattr(entry, attr, None)
+        if s:
+            try:
+                dt = parsedate_to_datetime(s)
+                if not dt.tzinfo: dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc)
+            except Exception: pass
     return None
 
-# ==== main loop ====
-def fetch_once():
-    global seen
-    posted=0
-    for url in DEFAULT_FEEDS:
-        feed=parse_feed(url)
-        if not feed: continue
-        src=getattr(feed.feed,"title",url)
-        for e in getattr(feed,"entries",[])[:10]:
-            title=(getattr(e,"title","") or "").strip()
-            link =(getattr(e,"link","") or "").strip()
-            if not title or make_uid(title) in seen: continue
-            article,_=extract_article_text(link)
-            ai=ai_classify(title,src,article)
-            dt=datetime.now(timezone.utc)
-            dt_est=dt.astimezone(EST)
-            when=f"{dt_est.strftime('%-I:%M %p')} {_tz_label} • {dt_est.strftime('%b %-d')}"
-            src_line=f'🔗 Source: <a href="{html_escape(link)}">{html_escape(src)}</a>' if link else f"🔗 {src}"
-            summ=ai.get("summary","").strip()
-            line=f"✍️ {html_escape(summ)}\n" if summ else ""
-            msg=f"{format_sentiment(ai)}\n📰 {html_escape(title)}\n{line}{src_line}\n🕒 {when}"
-            send_message(msg)
-            seen.add(make_uid(title))
-            posted+=1
-            if posted>=MAX_POSTS_PER_CYCLE: save_seen(seen);return
+def human_ago(delta: timedelta) -> str:
+    m = int(delta.total_seconds() // 60)
+    if m < 1: return "just now"
+    if m < 90: return f"{m} min ago"
+    h = m // 60
+    return f"{h} hr ago"
+
+# ---------- Article extraction (best effort) ----------
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"}
+def extract_article_text(url: str) -> str:
+    if not url: return ""
+    try:
+        r = requests.get(url, headers=UA, timeout=12)
+        if r.status_code in (401,403): return ""
+        r.raise_for_status()
+        full = BeautifulSoup(r.text, "html.parser")
+        ps = [p.get_text(" ", strip=True) for p in full.find_all("p")]
+        long_ps = [p for p in ps if len(p) >= 80]
+        return " ".join(long_ps)[:5000]
+    except Exception:
+        return ""
+
+# =========================
+# AI classification (headline-first) with retries & unblocked safety
+# =========================
+def ai_classify(title: str, source: str, article_text: str):
+    """
+    -> {"summary": "<=20 words OR ''", "sentiment": Bullish|Bearish|Neutral, "confidence": 0-100}
+    Works with headline only; uses context if available. Retries to avoid safety false-positives.
+    """
+    if not GEMINI_API_KEY:
+        return {"summary": "", "sentiment": "Neutral", "confidence": 60}
+
+    headline = (title or "").strip()
+    ctx = (article_text or "").strip()
+
+    system = (
+        "You are a market analyst. Using the HEADLINE (and context if any), "
+        "classify the next 1–3 session impact on NASDAQ.\n"
+        'Return STRICT JSON only: {"summary":"<=20 words (may be empty)","sentiment":"Bullish|Bearish|Neutral","confidence":0-100}.'
+    )
+    user = f"Headline: {headline}\nContext: {ctx[:2000] if ctx else '(none)'}\nJSON only."
+
+    tries = [GEMINI_SAFETY_A, [], None]  # block_none -> empty list -> omit field
+    for safety in tries:
+        try:
+            model = genai.GenerativeModel(GEMINI_MODEL)
+            res = model.generate_content(
+                [{"text": system}, {"text": user}],
+                generation_config={
+                    "temperature": 0.1,
+                    "max_output_tokens": 256,
+                    "response_mime_type": "application/json",
+                },
+                **({"safety_settings": safety} if safety is not None else {}),
+            )
+            raw = (res.text or "").strip()
+            start, end = raw.find("{"), raw.rfind("}")
+            data = json.loads(raw[start:end+1]) if start != -1 and end != -1 else {}
+            # normalize
+            norm = {str(k).lower(): v for k, v in (data or {}).items()}
+            summary = _trim_words((norm.get("summary") or "").strip(), 20)
+            sentiment = str(norm.get("sentiment", "Neutral")).title()
+            try: conf = int(float(norm.get("confidence", 60)))
+            except: conf = 60
+            # sentiment strict
+            s = sentiment.lower()
+            if "bull" in s: sentiment = "Bullish"
+            elif "bear" in s: sentiment = "Bearish"
+            else: sentiment = "Neutral"
+            # allow empty summary if unclear or generic
+            if summary.lower() in {"bullish","bearish","neutral", headline.lower()}:
+                summary = ""
+            return {"summary": summary, "sentiment": sentiment, "confidence": conf}
+        except Exception as e:
+            print("AI error (Gemini):", getattr(e, "message", str(e))[:120])
             time.sleep(1)
-    save_seen(seen)
+    # fallback
+    return {"summary": "", "sentiment": "Neutral", "confidence": 60}
+
+# =========================
+# Feed fetching with UA
+# =========================
+def parse_feed(url: str):
+    try:
+        r = requests.get(url, headers={"User-Agent": UA["User-Agent"]}, timeout=15)
+        if r.ok and r.content:
+            return feedparser.parse(r.content)
+    except Exception as e:
+        print("feed error:", url, e)
+    return None
+
+# =========================
+# Fetch & post (first 5 newest)
+# =========================
+def fetch_once(limit_per_feed=12):
+    global seen
+    # 1) gather entries
+    items = []
+    titles_seen_cycle = set()  # de-dup across sources within the same cycle
+
+    for url in FEEDS:
+        feed = parse_feed(url)
+        if not feed: continue
+        src = (getattr(getattr(feed, "feed", None), "title", None) or url).strip()
+        for e in getattr(feed, "entries", [])[:limit_per_feed]:
+            title = (getattr(e, "title", "") or "").strip()
+            link  = (getattr(e, "link", "") or "").strip()
+            if not title: continue
+            norm_t = normalize_title(title)
+            if norm_t in titles_seen_cycle: continue
+            titles_seen_cycle.add(norm_t)
+            dt_rss = published_dt_from_entry(e) or datetime.now(timezone.utc)
+            items.append({"src": src, "title": title, "link": link, "entry": e, "dt": dt_rss})
+
+    # 2) newest first
+    items.sort(key=lambda x: x["dt"], reverse=True)
+
+    # 3) post first N new items
+    posted = 0
+    now_utc = datetime.now(timezone.utc)
+
+    for it in items:
+        uid = make_uid(it["title"])
+        if uid in seen:  # already posted in previous cycles
+            continue
+
+        # freshness window
+        if (now_utc - it["dt"]) > timedelta(hours=MAX_AGE_HOURS):
+            continue
+
+        # try to enrich; OK if empty
+        article = extract_article_text(it["link"])
+        ai = ai_classify(it["title"], it["src"], article)
+
+        if HIDE_NEUTRAL and ai["sentiment"] == "Neutral":
+            continue
+        if ai["confidence"] < MIN_CONFIDENCE:
+            continue
+
+        # time label with “15 min ago”
+        dt_est = it["dt"].astimezone(EST)
+        ago_str = human_ago(now_utc - it["dt"])
+        when = f"{dt_est.strftime('%-I:%M %p ')}{_tz_label} • {dt_est.strftime('%b %-d')} ({ago_str})"
+
+        # source line
+        nice_src = publisher_from_link(it["link"], it["src"])
+        src_line = f'🔗 Source: <a href="{html_escape(it["link"])}">{html_escape(nice_src)}</a>' if it["link"] else f"🔗 Source: {html_escape(nice_src)}"
+
+        summary = (ai.get("summary") or "").strip()
+        summary_line = f"✍️ {html_escape(summary)}\n" if summary else ""
+
+        msg = (
+            f"{format_sentiment(ai)}\n"
+            f"📰 {html_escape(it['title'])}\n"
+            f"{summary_line}"
+            f"{src_line}\n"
+            f"🕒 {html_escape(when)}"
+        )
+
+        send_message(msg)
+        seen.add(uid)
+        posted += 1
+        if posted >= MAX_POSTS_PER_CYCLE:
+            break
+        time.sleep(1)
+
+    if posted:
+        save_seen(seen)
 
 def main():
-    send_message("✅ Gemini NASDAQ bot started (simple mode).")
+    send_message("✅ Gemini NASDAQ bot started (headline-first, newest 5 per cycle).")
     while True:
-        try: fetch_once()
-        except Exception as e: print("loop:",e)
+        try:
+            fetch_once()
+        except Exception as e:
+            print("loop error:", e)
         time.sleep(SLEEP_SECONDS)
 
-if __name__=="__main__": main()
+if __name__ == "__main__":
+    main()
