@@ -1,33 +1,14 @@
 services:
   - type: worker
-    name: smartflow-news
+    name: nasdaq-keyword-news
     env: python
+    plan: starter
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
     startCommand: python bot.py
-    buildCommand: pip install -r requirements.txt
     envVars:
       - key: TELEGRAM_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
-
-      # behavior (optional)
-      - key: SLEEP_SECONDS
-        value: "60"
-      - key: MAX_AGE_HOURS
-        value: "2"
-      - key: MIN_CONFIDENCE
-        value: "0"
-      - key: HIDE_NEUTRAL
-        value: "false"
-      - key: MAX_POSTS_PER_CYCLE
-        value: "0"
-      - key: REQUIRE_KEYWORDS
-        value: "false"
-      - key: SKIP_FETCH_DOMAINS
-        value: "wsj.com,ft.com,bloomberg.com"
-
-      # ✅ Gemini only
-      - key: GEMINI_API_KEY
-        sync: false
-      - key: GEMINI_MODEL
-        value: "gemini-1.5-flash"
